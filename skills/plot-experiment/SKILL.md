@@ -85,7 +85,8 @@ props=[...], scope="per_sample")))` (and the same for `coulter`). With the defau
 paired sample's per-property columns are all equal. Point out any sample where
 gating or rejection removes an unusually large fraction. The same table goes in the notes (step 6)
 and on the first slide(s) of the main deck (`save_pptx(..., count_tables=...)`, already in the
-template).
+template). After the count tables, any grid heatmaps come first in the deck, ahead of every other
+figure.
 
 **Grid-search heatmaps — suggest, never assume.** If two annotation columns were varied *together*
 across samples (a grid search, e.g. media osmolarity × drug dose), a heatmap of the per-sample mean

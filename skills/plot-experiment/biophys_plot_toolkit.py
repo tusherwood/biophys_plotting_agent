@@ -2135,7 +2135,8 @@ def _add_count_slides(prs, layout, label, records) -> int:
 
 def save_pptx(fig_dir, out_path, count_tables=None) -> None:
     """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit).
-    The deck name should start with the analysis dir's date (e.g. '2026-09-22_<exp>_figures.pptx')
+    Grid heatmaps (*_heatmap_*.png) come first, before every other figure; the rest follow in
+    filename order. The deck name should start with the analysis dir's date (e.g. '2026-09-22_<exp>_figures.pptx')
     — a warning is printed if it doesn't. No PNGs (or no fig_dir) -> no deck is written.
 
     count_tables: optional {label: records} (e.g. {"iFXM": ifxm, "Coulter": coulter}, the records
@@ -2160,7 +2161,8 @@ def save_pptx(fig_dir, out_path, count_tables=None) -> None:
 
     n_tables = sum(_add_count_slides(prs, blank_layout, label, recs)
                    for label, recs in (count_tables or {}).items() if recs)
-    pngs = sorted(fig_dir.glob("*.png"))
+    # Grid heatmaps lead the figure slides (right after the count tables); the rest stay alphabetical.
+    pngs = sorted(fig_dir.glob("*.png"), key=lambda p: ("_heatmap_" not in p.name, p.name))
     for png in pngs:
         img_w, img_h = PILImage.open(png).size
         if img_w / img_h > slide_w / slide_h:
