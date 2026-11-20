@@ -18,8 +18,11 @@ one half):
 ```
 <...>_compiled/                     # from compile_experiment.py  (iFXM)
 ├── experiment_data.xlsx            # 'metadata' sheet + one worksheet per sample + 'README'
-├── images.h5                       # raw h5py BF image stacks (NOT needed for these plots)
+│                                   #   (+ 'sickle_annotations' if annotate_sickle_cells.py ran)
+├── concat_vqvae_cache.pt           # per-frame crop images (NOT needed for these plots)
+├── concat_vqvae_cache_metadata.parquet  # one row per crop; see "Per-cell ids" below
 └── {sheet}_pair_overflow.csv       # only if a paired block exceeded Excel's row limit
+                                    # (older compiles had an images.h5 instead of the crop cache)
 
 <...>_coulter_sample_annotation/    # from annotate_coulter_samples.py  (Coulter)
 ├── metadata.csv                    # one row per Coulter sample + annotations
@@ -119,6 +122,36 @@ notes and the deck's first slide(s) (`save_pptx(..., count_tables={"iFXM": ifxm,
 matches each paired cell to the `mass_` row with the identical `mass_pg` value and takes its
 `mass_peak_time_h` (hours since run start), stored row-aligned as `record["time_h"]` (NaN if there's
 no match or the mass value is ambiguous). Used by `props_vs_time`.
+
+### Per-cell ids — joining the workbook to the crop cache / sickle sheet
+
+The loaders only read the `metadata` sheet and the per-sample sheets, so none of this affects them.
+It matters when a driver joins other per-cell data onto a sample's cells (e.g. a past analysis that
+split density by sickle class).
+
+- `pair_cell_id` / `vol_cell_id` in a sample sheet: the CELLGROUPED hdf5's **per-sample integer**
+  id (1, 2, 3, … restarting in every sample). Unique only within its sheet.
+- `concat_vqvae_cache_metadata.parquet`, current compiles: `cell_id` is the **string**
+  `"<sample_name>_<n>"` (unique across samples; what VAEImagingAnalysis keys on) and
+  `cell_id_source` is the integer `n`. Older compiles: `cell_id` is the integer itself and there
+  is no `cell_id_source`.
+- `sickle_annotations` sheet (one row per cell): same rule — `cell_id` + `cell_id_source` on
+  current compiles, integer `cell_id` alone on older ones.
+
+So join a sample's `pair_` (or `vol_`) block on `sample_name` **and** `cell_id_source` when that
+column exists, else on `cell_id`. With the block read by `tk._read_block` (prefix stripped, so
+the id column is `cell_id`):
+
+```python
+sickle = pd.read_excel(xls, sheet_name="sickle_annotations")
+key = "cell_id_source" if "cell_id_source" in sickle.columns else "cell_id"
+pair = tk._read_block(xls, xlsx_path, sheet, "pair")
+sub = sickle.loc[sickle["sample_name"] == sample, [key, "sickle_class"]]
+merged = pair.merge(sub, left_on="cell_id", right_on=key, how="inner")
+```
+
+Merging on the sickle sheet's / parquet's `cell_id` directly fails on current compiles (pandas
+raises on float vs str keys), as does casting it to a number.
 
 ### Density is always absolute — no baseline to supply
 

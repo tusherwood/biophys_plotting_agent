@@ -40,7 +40,10 @@ the new dataset's columns. Still run steps 1–2 on the new data: inspect its me
 plan you present call out every difference from the past analysis (renamed/missing/new columns,
 different levels, a grid that's no longer crossed) and what you propose for each. Anything the
 notes flag as experiment-specific gets re-decided with the user, not copied. If there's no notes
-file, fall back to the past driver alone and say so.
+file, fall back to the past driver alone and say so. If the past driver joins other per-cell data
+(the `sickle_annotations` sheet, the crop-cache parquet) onto `pair_cell_id`, re-check its join key
+against "Per-cell ids" in `data_schema.md`: current compiles namespace `cell_id`, so the join
+goes through `cell_id_source`.
 
 ### 1. Locate & inspect the input
 The loaders read the **raw** biophys_helpers outputs directly (no reorg step). Find whichever the
