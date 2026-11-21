@@ -9,6 +9,7 @@ dependencies:
   - matplotlib
   - openpyxl
   - pillow
+  - pyarrow   # export_processed_cache: reading/writing the crop cache's metadata parquet
   - pip
   - pip:
     - python-pptx

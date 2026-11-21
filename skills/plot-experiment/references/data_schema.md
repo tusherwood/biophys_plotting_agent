@@ -232,13 +232,23 @@ given a folder, the loader looks for `experiment_data.xlsx` inside it.
 - **Sample sheets:** one per sample, with the same `sheet_name`, holding only the property columns
   under their source names. A paired sample has `pair_cell_id`, `pair_mass_pg`, `pair_volume_fl`
   and `pair_cell_density_g_per_mL`, row-aligned. A joint-rejected cell is gone from the whole row.
-  An unpaired sample has `mass_mass_pg` and/or `vol_volume_*`, side by side with a blank spacer.
+  An unpaired sample has `mass_mass_pg` and/or `vol_cell_id` + `vol_volume_*`, side by side with
+  a blank spacer.
 - **`metadata`:** the source rows plus `n_<block>_after_outlier_rejection`, which is structural.
 - **`README`:** source, date and outlier spec.
 
-Loader records carry the provenance this needs: `sheet`, `columns` (prop → source column), and
-for paired samples a row-aligned `cell_id` that `reject_outliers` trims with the props. Blocks over
-Excel's row limit spill to `{sheet}_{prefix}_overflow.csv` beside the xlsx.
+Loader records carry the provenance this needs: `sheet`, `columns` (prop → source column), for
+paired samples a row-aligned `cell_id` that `reject_outliers` trims with the props, and for
+volume-only samples `prop_cell_id = {"vol": ids}` (+ `prop_cell_id_column`), aligned with
+`props["vol"]` and trimmed with it. Blocks over Excel's row limit spill to
+`{sheet}_{prefix}_overflow.csv` beside the xlsx.
+
+**Cropped crop cache (iFXM, asked each run).** `export_processed_cache` writes
+`processed_data/<exp>_vqvae_cache.pt` + `<exp>_vqvae_cache_metadata.parquet`: the compiled crop
+cache cut to the crops of the cells in the records it is given (the same records as
+`export_processed`), matched per sample on `cell_id_source` (or `cell_id` on older compiles) against
+those `cell_id` / `prop_cell_id["vol"]` arrays. Every tensor is kept; parquet row i is still tensor
+row i, `cache_row` is renumbered and the compiled row is kept as `cache_row_compiled`.
 
 - `datatype` ∈ {`coulter`, `ifxm`}
 - `prop` ∈ {`volume`} (coulter) / {`mass`, `density`, `vol`} (ifxm)

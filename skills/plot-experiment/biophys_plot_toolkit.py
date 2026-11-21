@@ -521,8 +521,16 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                 if vol.size:
                     counts.append(_cell_count("volume", _ungated("volume", vol.size),
                                               props["vol"].size, ["vol"]))
+                # Per-prop cell ids (vol only: mass_ rows have no imaged cell), aligned with
+                # props["vol"]; reject_outliers trims them with that prop. Used by
+                # export_processed (vol_cell_id) and export_processed_cache.
+                extra = {}
+                if vol.size and _CELL_ID in volblk.columns:
+                    extra = {"prop_cell_id": {"vol": volblk[_CELL_ID].to_numpy()[ix_mask]},
+                             "prop_cell_id_column": {"vol": f"vol_{_CELL_ID}"}}
             recs.append({"sample": sample, "props": props, "meta": meta_bag,
-                         "cell_counts": counts, "sheet": r[skey], "columns": columns})
+                         "cell_counts": counts, "sheet": r[skey], "columns": columns,
+                         **extra})
     return recs
 
 
@@ -739,15 +747,21 @@ def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=Fal
             out.append({**r, "props": newprops, **extras})
             continue
         else:
+            # per-prop cell ids (unpaired volume-only samples) are trimmed with their prop
+            ids = dict(r.get("prop_cell_id") or {})
             for p in sel:
                 a = np.asarray(r["props"].get(p, []), float)
                 if a.size == 0:
                     continue
                 keep = outlier_mask(a, meth(p), log=log, ref=ref_for(r, p), **kw)
                 newprops[p] = a[keep]
+                if p in ids and np.asarray(ids[p]).size == a.size:
+                    ids[p] = np.asarray(ids[p])[keep]
                 if verbose:
                     print(f"  reject[{r['sample']}] {p} ({meth(p)}): "
                           f"{a.size - int(keep.sum())}/{a.size}")
+            if ids:
+                r = {**r, "prop_cell_id": ids}
         out.append({**r, "props": newprops})
     return out
 
@@ -1860,6 +1874,11 @@ def _export_blocks(r) -> list:
         data = {}
         if block == "paired" and "cell_id" in r:
             data[r.get("cell_id_column", f"pair_{_CELL_ID}")] = np.asarray(r["cell_id"])
+        for p in props:   # unpaired volume block: vol_cell_id, aligned with the vol prop
+            ids = (r.get("prop_cell_id") or {}).get(p)
+            if block != "paired" and ids is not None and \
+                    np.asarray(ids).size == np.asarray(r["props"][p]).size:
+                data[r["prop_cell_id_column"][p]] = np.asarray(ids)
         for p in props:
             data[cols[p]] = np.asarray(r["props"][p], float)
         out.append((block, _BLOCK_PREFIX[block], pd.DataFrame(data)))
@@ -1875,7 +1894,7 @@ def export_processed(records, compiled_dir, out_path) -> Path:
       * one worksheet per sample (same `sheet_name`) holding only the mass / volume / density
         columns under their original names — a paired sample's `pair_` block (pair_cell_id,
         pair_mass_pg, pair_volume_fl, pair_cell_density_g_per_mL; one row per kept cell), an
-        unpaired sample's `mass_mass_pg` and/or `vol_volume_*` (side by side, one blank spacer
+        unpaired sample's `mass_mass_pg` and/or `vol_cell_id` + `vol_volume_*` (side by side, one blank spacer
         column between blocks). A block over Excel's row limit is written in full to
         '{sheet}_{prefix}_overflow.csv' beside the xlsx and truncated in the sheet.
       * 'metadata' — the source metadata rows of the exported samples, plus
@@ -1937,7 +1956,8 @@ def export_processed(records, compiled_dir, out_path) -> Path:
                                 "property."),
             ("columns", "pair_cell_id, pair_mass_pg (pg), pair_volume_fl (fL), "
                         "pair_cell_density_g_per_mL (absolute, g/mL); unpaired: mass_mass_pg, "
-                        "vol_volume_fl (or legacy vol_volume_fL / vol_volume_au)."),
+                        "vol_cell_id + vol_volume_fl (or legacy vol_volume_fL / vol_volume_au; "
+                        "vol_cell_id only when the source block had it)."),
             ("metadata", "Source metadata rows of the exported samples; "
                          "n_<block>_after_outlier_rejection = cells written per block."),
             ("samples", f"{len(written)}"),
@@ -1948,6 +1968,106 @@ def export_processed(records, compiled_dir, out_path) -> Path:
             xw, sheet_name="README", index=False)
     print(f"  processed data: {len(written)} samples -> {out_path}")
     return out_path
+
+
+_CACHE_PT      = "concat_vqvae_cache.pt"                # compile_experiment.py's crop-cache pair
+_CACHE_PARQUET = "concat_vqvae_cache_metadata.parquet"
+
+
+def _record_cell_ids(r):
+    """The per-sample integer ids of a load_ifxm record's kept cells, or None if it has none
+    (paired: `cell_id`, row-aligned with the props; unpaired volume-only: prop_cell_id['vol'];
+    mass-only samples have no imaged cells)."""
+    if "cell_id" in r:
+        ids = r["cell_id"]
+    else:
+        ids = (r.get("prop_cell_id") or {}).get("vol")
+    if ids is None:
+        return None
+    ids = np.asarray(ids, float)
+    return ids[np.isfinite(ids)].astype(np.int64)
+
+
+def export_processed_cache(records, compiled_dir, out_pt) -> Path | None:
+    """Write the VQ-VAE crop cache cropped to the plotted cells: only the crops of cells kept in
+    `records`, so the images match the biophysical data exactly (gated upstream, finite, joint
+    outlier rejection). Pass the SAME load_ifxm records given to export_processed, after
+    reject_outliers.
+
+    Reads compile_experiment.py's concat_vqvae_cache.pt + concat_vqvae_cache_metadata.parquet from
+    `compiled_dir` and writes `out_pt` plus `<out_pt stem>_metadata.parquet` beside it (the names
+    VAEImagingAnalysis' run_pipeline.py looks for, so `--data <out_pt's dir>` trains on it). Every
+    tensor is kept; in the parquet `cache_row` is renumbered (still indexes the new tensors) and the
+    compiled cache's row is kept as `cache_row_compiled`. Samples absent from `records` lose all
+    their crops. Matches cells on (sample_name, cell_id_source), or (sample_name, cell_id) for
+    caches compiled before cell_id was namespaced.
+
+    Torch-free and streamed (vqvae_cache_io.py, which must sit next to this file — copy it into the
+    analysis dir with the toolkit). Needs pyarrow. Returns `out_pt`, or None (with a note) when the
+    compiled dir has no crop cache."""
+    try:
+        import pyarrow.parquet as pq
+        import vqvae_cache_io as vci
+    except ImportError as exc:
+        raise ImportError(
+            f"export_processed_cache needs pyarrow and vqvae_cache_io.py next to the toolkit "
+            f"(copy it from the plugin's skills/plot-experiment/ dir): {exc}") from exc
+
+    xlsx = _open_ifxm_xlsx(compiled_dir)
+    pt_in, pq_in = xlsx.parent / _CACHE_PT, xlsx.parent / _CACHE_PARQUET
+    if not (pt_in.exists() and pq_in.exists()):
+        print(f"  note: no crop cache in {xlsx.parent.name} (compiled with --no-vqvae?); "
+              f"nothing to crop")
+        return None
+    out_pt = Path(out_pt)
+    pq_out = out_pt.with_name(out_pt.stem + "_metadata.parquet")
+
+    meta = pd.read_excel(xlsx, sheet_name="metadata")
+    skey = "sheet_name" if "sheet_name" in meta.columns else "sample_name"
+    sample_of = dict(zip(meta[skey].astype(str), meta["sample_name"].astype(str)))
+
+    # kept cell ids per compiled sample_name (union, should records repeat a sample)
+    wanted: dict[str, set] = {}
+    for r in records:
+        ids = _record_cell_ids(r)
+        sample = sample_of.get(str(r.get("sheet")), str(r.get("sample")))
+        if ids is None:
+            if r.get("props", {}).get("vol", _EMPTY).size:
+                print(f"  [warn] {sample}: no per-cell ids in its block (older workbook?); its "
+                      f"crops are left out")
+            continue
+        wanted.setdefault(sample, set()).update(ids.tolist())
+
+    names = pq.ParquetFile(str(pq_in)).schema_arrow.names
+    key = "cell_id_source" if "cell_id_source" in names else "cell_id"
+    t = pq.read_table(str(pq_in), columns=["sample_name", key])
+    samples = np.asarray(t.column("sample_name").to_pylist(), dtype=object)
+    cids = t.column(key).to_numpy(zero_copy_only=False)
+    keep = np.zeros(len(samples), bool)
+    print(f"  crop cache: {pt_in.name} ({len(samples):,} crops) -> {out_pt.name}")
+    for sample in dict.fromkeys(samples):
+        rows = samples == sample
+        want = wanted.get(sample)
+        if not want:
+            print(f"    {sample}: not in the plotted records, all {int(rows.sum()):,} crops "
+                  f"dropped")
+            continue
+        ids = np.asarray(cids[rows], float)
+        hit = np.isfinite(ids) & np.isin(np.where(np.isfinite(ids), ids, -1).astype(np.int64),
+                                         np.fromiter(want, np.int64))
+        keep[np.flatnonzero(rows)[hit]] = True
+        n_cells = len(np.unique(ids[hit]))
+        no_crops = len(want) - n_cells
+        print(f"    {sample}: {n_cells:,} cells, {int(hit.sum()):,}/{int(rows.sum()):,} crops kept"
+              + (f" ({no_crops:,} plotted cells have no crops)" if no_crops else ""))
+    missing = sorted(set(wanted) - set(samples.tolist()))
+    if missing:
+        print(f"  [warn] plotted samples with no crops in the cache: {missing}")
+
+    shapes = vci.filter_cache(pt_in, pq_in, keep, out_pt, pq_out)
+    shape_txt = ", ".join(f"{k} {v}" for k, v in shapes.items())
+    print(f"  cropped cache: {int(keep.sum()):,} crops ({shape_txt}) -> {out_pt}")
+    return out_pt
 
 
 # ---------------------------------------------------------------------------

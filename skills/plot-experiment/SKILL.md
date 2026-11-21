@@ -26,6 +26,8 @@ Bundled files (reference via `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/`):
   `grid_heatmap`/`props_vs_time`)
   → `build_plan`/`render_plan`/`autoplot` → pptx (plus a default second `props_vs_time` deck).
 - `reference_driver.py` — the driver template you adapt.
+- `vqvae_cache_io.py` — torch-free crop-cache row selection behind `tk.export_processed_cache`
+  (copied into the analysis dir only when the user wants the cropped image cache).
 - `references/data_schema.md` — the exact xlsx/csv/metadata schema + role table. **Read it first.**
 - `references/analysis_notes_template.md` — outline for the per-analysis notes file (step 6).
 
@@ -116,6 +118,16 @@ in "Outlier rejection" below). When reusing a past analysis (step 0), also offer
 analysis's spec as an option if it differs. Wire the answer into the driver (see that section)
 before running it; never skip the question even if the user already approved the plot plan.
 
+**Crop the image cache — ask every run that has one (hard requirement).** If the `*_compiled/` dir
+holds `concat_vqvae_cache.pt` + `concat_vqvae_cache_metadata.parquet`, ask in the same
+`AskUserQuestion` call as outlier rejection whether to also crop the VQ-VAE crop cache to the cells
+the plots keep (gated, finite, and after the chosen outlier rejection), i.e. keep only the images
+whose biophysical data was retained. Ask even when rejection is declined (the crop then matches
+the gated cells). Options: **yes** / **no**; say the output is a second copy of the kept crops
+(size ≈ the compiled cache × fraction kept). A yes sets `CROP_CACHE = True` in the driver (see
+"Cropped crop cache" below); a past analysis's answer (step 0) is the suggested option. Skip the
+question when there is no cache, and say so in the plan.
+
 Behavior to convey: **every** boolean/categorical/approved-ordered column becomes its own grouping
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
@@ -143,7 +155,9 @@ loudly rather than silently falling back.
 ### 3. Generate the driver
 1. Create the analysis output dir. Into it, **copy**
    `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/biophys_plot_toolkit.py` (keeps each analysis
-   self-contained, git-committable, reproducible independent of the plugin install).
+   self-contained, git-committable, reproducible independent of the plugin install). When the user
+   asked for the cropped image cache, also copy `vqvae_cache_io.py` from the same dir (the toolkit
+   imports it only for that).
 2. Adapt `reference_driver.py` into that dir: set `EXP_NAME`, `COMPILED_DIR` (iFXM) and/or
    `COULTER_DIR` (Coulter, `None` if absent), `FIG_DIR`, `PPTX_OUT`, and set
    `ROLE_OVERRIDES` to the choices the user made in step 2 (resolving every `[CONFIRM]`) and
@@ -328,13 +342,29 @@ lines and writes `processed_data/<EXP_NAME>_processed.xlsx` (in `OUT_ROOT`, besi
 cells the plots show, in `experiment_data.xlsx`'s layout. Each sample gets one sheet, under the
 same sheet name. A paired sample's sheet holds `pair_cell_id`, `pair_mass_pg`, `pair_volume_fl` and
 `pair_cell_density_g_per_mL`, one row per kept cell, so a cell removed by the joint trim is gone
-from the whole row. An unpaired sample's sheet holds `mass_mass_pg` and/or `vol_volume_fl`. The
+from the whole row. An unpaired sample's sheet holds `mass_mass_pg` and/or `vol_cell_id` +
+`vol_volume_fl`. The
 workbook also has a `metadata` sheet (the source rows plus `n_<block>_after_outlier_rejection`)
 and a `README` sheet (source, date, outlier spec). It must get the `load_ifxm` records **after**
 rejection. If rejection was declined, it holds the gated cells. It reloads with
 `tk.load_ifxm(<path to the .xlsx>)`. Pass the file, not the `processed_data/` folder, because a
 folder makes the loader look for `experiment_data.xlsx`.
 Coulter data is not exported. Keep the block unless the user says to skip it.
+
+**Cropped crop cache (asked in step 2; `CROP_CACHE = True` on a yes).** Right after
+`export_processed`, `tk.export_processed_cache(ifxm, COMPILED_DIR, PROCESSED_CACHE)` writes
+`processed_data/<EXP_NAME>_vqvae_cache.pt` + `<EXP_NAME>_vqvae_cache_metadata.parquet`: the compiled
+crop cache keeping only the crops of cells in the records it is given — pass the same `load_ifxm`
+records as `export_processed`, after rejection. A crop is kept iff its (`sample_name`,
+`cell_id_source`) — or (`sample_name`, `cell_id`) on caches compiled before cell_id was
+namespaced — is a plotted cell: paired samples by `pair_cell_id`, volume-only samples by
+`vol_cell_id` (carried per prop and trimmed by `reject_outliers`); samples not in the records lose
+all their crops. It prints, per sample, cells and crops kept. Every tensor is kept; `cache_row` is
+renumbered (the compiled row stays as `cache_row_compiled`). The names are what
+VAEImagingAnalysis' `run_pipeline.py --data <processed_data dir>` looks for, and the processed
+workbook beside it supplies the explorer's `meta_*` coloring. Torch-free and streamed (memory stays
+flat), via `vqvae_cache_io.py`, which must be copied into the analysis dir with the toolkit; needs
+`pyarrow`. A compiled dir with no cache prints a note and writes nothing.
 
 Notes: always clean both iFXM record sets with the same spec. `load_ifxm_paired` records are
 always trimmed jointly, even with `joint=False`, so scatter rows stay aligned. `verbose=True`

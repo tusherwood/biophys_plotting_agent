@@ -13,7 +13,8 @@ plots from those roles; `autoplot` runs them. Every column becomes a grouping/co
 time column is used to order samples sequentially. Use the explicit combinators (see the bottom of
 main) for full control.
 
-Run it with the same Python env that has: numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow.
+Run it with the same Python env that has: numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow
+(+ pyarrow, and vqvae_cache_io.py beside the toolkit, when CROP_CACHE is on).
 """
 from pathlib import Path
 
@@ -45,6 +46,10 @@ TIME_PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_props_vs_time.pptx"
 # Default export (iFXM): the plotted cells (gated + post-outlier-rejection) as an xlsx in
 # experiment_data.xlsx's layout — one sheet per sample, mass / volume / density columns only.
 PROCESSED_XLSX = OUT_ROOT / "processed_data" / f"{EXP_NAME}_processed.xlsx"
+# Optional (Claude asks each run): the compiled VQ-VAE crop cache cropped to the same cells, beside
+# PROCESSED_XLSX (+ <stem>_metadata.parquet). Needs vqvae_cache_io.py copied next to the toolkit.
+CROP_CACHE      = False
+PROCESSED_CACHE = OUT_ROOT / "processed_data" / f"{EXP_NAME}_vqvae_cache.pt"
 # Claude writes OUT_ROOT / f"{EXP_NAME}_analysis_notes.md" next to the deck (data structure +
 # plotting choices) so a future dataset can be analyzed the same way.
 
@@ -102,11 +107,16 @@ def main() -> None:
 
     # --- Processed-data export (default, iFXM): exactly the cells the plots show --------------
     # One sheet per sample (same sheet names), pair_cell_id + pair_mass_pg / pair_volume_fl /
-    # pair_cell_density_g_per_mL (unpaired: mass_mass_pg / vol_volume_fl), plus metadata + README
-    # sheets. Pass the load_ifxm records after reject_outliers. Reloads with
+    # pair_cell_density_g_per_mL (unpaired: mass_mass_pg / vol_cell_id + vol_volume_fl), plus
+    # metadata + README sheets. Pass the load_ifxm records after reject_outliers. Reloads with
     # tk.load_ifxm(PROCESSED_XLSX), the file path, not its folder.
     if ifxm:
         tk.export_processed(ifxm, COMPILED_DIR, PROCESSED_XLSX)
+    # --- Cropped crop cache (if the user said yes): the images of exactly those cells ---------
+    # Same records as export_processed. Writes PROCESSED_CACHE + its _metadata.parquet, the pair
+    # VAEImagingAnalysis' run_pipeline.py trains on (--data <processed_data dir>).
+    if ifxm and CROP_CACHE:
+        tk.export_processed_cache(ifxm, COMPILED_DIR, PROCESSED_CACHE)
 
     # --- iFXM: inspect the annotation schema, show the plan, run it -----------------------
     if ifxm:
