@@ -189,6 +189,8 @@ Notes:
   `suggest_grids` and listed by `render_plan` as *suggested* heatmaps; they're only plotted
   (`grid_heatmap`) once the user confirms and the pair is added to the driver's `GRID_PAIRS`.
 - Replicate is parsed from `rep\d+` in `sample_name` and exposed as `meta["rep"]` for ordering/labels.
+  A `meta_rep` column (written by compile_experiment.py's auto-detect-from-names) carries the same
+  number; `infer_roles` skips both, so neither shows up as a grouping/ordered column to confirm.
 - `condition`/`drug_name` still get the reference value fixups (`drug_treat`→`drug_treated`;
   drug lowercased, `zt1a`→`zt-1a`) via `VALUE_NORMALIZERS` (overridable per loader).
 

@@ -867,11 +867,13 @@ def classify_column(col, values) -> dict:
                  reason=f"categorical, {len(uniq)} values{note}")
 
 
-def infer_roles(records, *, overrides=None, skip=("rep",)) -> dict:
+def infer_roles(records, *, overrides=None, skip=("rep", "meta_rep")) -> dict:
     """Classify every metadata column present across `records` into a RoleInfo. `overrides` is a
     {col: role_name} map that pins a column's role (e.g. force a numeric column to 'ordered' or
-    'categorical' after the user confirms the plan). `skip` omits synthesized columns from the
-    report (rep is always available for ordering/labels regardless)."""
+    'categorical' after the user confirms the plan). `skip` omits replicate columns from the
+    report: the synthesized `rep` (always available for ordering/labels regardless) and
+    `meta_rep`, which compile_experiment.py's auto-detect-from-names writes from the same rep<n>
+    token — a replicate index is never a plotting group or an ordered gradient to confirm."""
     cols = []
     for r in records:
         for c in r.get("meta", {}):
