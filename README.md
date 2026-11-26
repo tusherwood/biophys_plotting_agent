@@ -9,8 +9,11 @@ The plugin ships a skill, **`plot-experiment`**, that:
 1. inspects a compiled/annotated experiment's schema (conditions, drug treatments, time points),
 2. generates a short, self-contained plotting driver on top of a bundled toolkit, and
 3. runs it to produce the standard figure grid — ridge histograms, box+jitter plots, timecourse
-   scatters, and per-cell property-vs-property scatters (e.g. volume vs mass / density) — plus a
-   PowerPoint deck,
+   scatters, and per-cell property-vs-property scatters (e.g. volume vs mass / density), plus
+   replicate-aware statistics against a control you confirm (per-sample medians, % change with
+   bootstrap CIs, decile shifts, effect sizes and p-values) — as a PowerPoint deck, with separate
+   decks for per-cell properties over run time and for QC (cell counts, acquisition drift,
+   pairing confidence),
 4. writes a short `<exp>_analysis_notes.md` next to the deck describing the data structure and
    plotting choices.
 

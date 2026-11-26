@@ -15,6 +15,13 @@ Three layers, low -> high:
   * plot_grouped / compare_groups / timecourse_by / scatter_by / facet / cross_groups /
     grid_heatmap      -> mid-level combinators parameterized by WHICH column(s) to use.
                          (suggest_grids flags grid-search column pairs for grid_heatmap.)
+  * replicate_summary / fold_change / quantile_shift (+ compare_to_reference / stats_table)
+                      -> replicate-aware statistics vs a user-confirmed reference (control) value,
+                         compared within strata (crossed columns such as time).
+  * attach_cell_annotations / split_by_cell_col
+                      -> join a per-cell table (sickle_annotations) and split samples by it.
+  * qc_report (qc_cell_counts / qc_drift / qc_pair_confidence)
+                      -> the separate QC deck.
   * build_plan / render_plan / autoplot
                       -> high-level: infer a plot plan from the roles, show it, execute it.
 
@@ -44,12 +51,14 @@ reject_outliers tags what it did, so cell_count_rows / render_cell_counts / save
 the per-sample cell counts at every stage.
 """
 import re
+import zlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_agg import RendererAgg
 from matplotlib.colors import to_rgb
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.transforms import blended_transform_factory
 from pathlib import Path
@@ -254,6 +263,9 @@ _VOL_UNCAL = "volume_au"        # legacy VOLUME block uncalibrated (AU) -> 'vol_
 # then the legacy *_ProcessedVolumes 'vol_volume_fL'.
 _VOL_CALS  = ("volume_fl", "volume_fL")
 _CELL_ID = "cell_id"            # PAIRED block per-cell id -> 'pair_cell_id' (kept for export)
+# PAIRED block pairing-confidence columns, carried row-aligned as record["qc"] for the QC deck
+# (qc_pair_confidence). Optional: a pair_ block without them just has no qc entry.
+_PAIR_QC = ("mass_confidence_score", "volume_confidence", "density_confidence")
 
 
 def _find_coulter_data_csv(d: Path, meta_path: Path) -> Path:
@@ -475,6 +487,10 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                 if _CELL_ID in pair.columns:
                     src["cell_id"] = pair[_CELL_ID].to_numpy()[mask]
                     src["cell_id_column"] = f"pair_{_CELL_ID}"
+                qc = {c: pd.to_numeric(pair[c], errors="coerce").to_numpy(float)[mask]
+                      for c in _PAIR_QC if c in pair.columns}
+                if qc:
+                    src["qc"] = qc   # row-aligned pairing confidences (QC deck)
                 if paired:
                     t = _pair_time_h(_read_block(xls, xlsx, r[skey], "mass", cache), mass)
                     recs.append({"sample": sample, "props": props, "meta": meta_bag,
@@ -647,6 +663,29 @@ def keep_percentile(a, lower=1.0, upper=99.0, *, log=False, ref=None):
 
 
 _ROW_EXTRAS = ("time_h", "cell_id")   # per-cell record arrays kept row-aligned with the props
+_ROW_DICTS = ("qc", "cell_meta")       # per-cell {name: array} dicts, row-aligned with the props
+
+
+def _mask_row_dicts(r, keep, length) -> dict:
+    """The record's row-aligned {name: array} dicts (qc confidences, attached per-cell
+    annotations) with `keep` applied — so they stay aligned with the props after a trim/split."""
+    out = {}
+    for k in _ROW_DICTS:
+        if k in r and r[k] is not None:
+            out[k] = {n: (np.asarray(v)[keep] if np.asarray(v).size == length else v)
+                      for n, v in r[k].items()}
+    return out
+
+
+def _mask_record(r, keep) -> dict:
+    """A copy of row-aligned record `r` keeping only the cells where `keep` is True: props,
+    time_h / cell_id and the qc / cell_meta dicts."""
+    length = keep.size
+    props = {p: (np.asarray(a, float)[keep] if np.asarray(a).size == length else np.asarray(a))
+             for p, a in r["props"].items()}
+    extras = {k: np.asarray(r[k])[keep] for k in _ROW_EXTRAS
+              if k in r and np.asarray(r[k]).size == length}
+    return {**r, "props": props, **extras, **_mask_row_dicts(r, keep, length)}
 
 
 def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=False,
@@ -662,7 +701,7 @@ def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=Fal
     joint  : True (default) — for a row-aligned record (an iFXM paired sample, from either loader)
              every selected prop's cutoffs are computed ONCE from the untrimmed cells, the keep-masks
              are AND-combined (a cell outside ANY prop's cutoffs is dropped), and that one mask is
-             applied to EVERY prop (and `time_h` / `cell_id`). So a cell rejected on mass is gone from the
+             applied to EVERY prop (and `time_h` / `cell_id` / the `qc` and `cell_meta` dicts). So a cell rejected on mass is gone from the
              volume and density plots too, and load_ifxm / load_ifxm_paired records trimmed with the
              same spec hold identical cells. Single pass: cutoffs are not recomputed after the
              joint trim. Records that aren't row-aligned (unpaired mass-only / volume-only samples,
@@ -744,6 +783,7 @@ def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=Fal
             # per-cell extras row-aligned with the props get the same mask
             extras = {k: np.asarray(r[k])[keep] for k in _ROW_EXTRAS
                       if k in r and np.asarray(r[k]).size == length}
+            extras.update(_mask_row_dicts(r, keep, length))   # qc / cell_meta
             out.append({**r, "props": newprops, **extras})
             continue
         else:
@@ -763,6 +803,91 @@ def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=Fal
             if ids:
                 r = {**r, "prop_cell_id": ids}
         out.append({**r, "props": newprops})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-cell annotations — join a per-cell table (e.g. the sickle_annotations sheet) onto the cells,
+# then split each sample by one of its columns so every combinator can group by it.
+# ---------------------------------------------------------------------------
+def _id_floats(values) -> np.ndarray:
+    return pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(float)
+
+
+def attach_cell_annotations(records, compiled_dir=None, *, table=None, sheet="sickle_annotations",
+                            columns=None, sample_col="sample_name") -> list:
+    """Return NEW records whose row-aligned `cell_meta` = {col: per-cell values} holds the columns
+    of a per-cell table joined onto each sample's cells (NaN/None where a cell has no row).
+
+    The table is `table` (a DataFrame) or, by default, the `sheet` worksheet of the compiled
+    experiment_data.xlsx (`compiled_dir`). It needs `sample_col` plus `cell_id_source` (current
+    compiles, where `cell_id` is the namespaced "<sample>_<n>") or an integer `cell_id` (older
+    compiles); it is matched per sample against the record's pair_cell_id (see "Per-cell ids" in
+    data_schema.md). `columns`: which table columns to carry (default: every non-key column).
+    Only row-aligned paired records (they carry `cell_id`) can be annotated; others pass through
+    unchanged with a note. Call AFTER reject_outliers (it trims `cell_id`; cell_meta is trimmed
+    with the props if rejection runs later anyway). Use split_by_cell_col next."""
+    if table is None:
+        table = pd.read_excel(_open_ifxm_xlsx(compiled_dir), sheet_name=sheet)
+    _require_col(table, sample_col, "sample-name")
+    key = "cell_id_source" if "cell_id_source" in table.columns else "cell_id"
+    _require_col(table, key, "cell-id")
+    columns = list(columns) if columns else [
+        c for c in table.columns if c not in (sample_col, "cell_id", "cell_id_source")]
+    for c in columns:
+        _require_col(table, c, "annotation")
+    t = table.assign(_key=_id_floats(table[key]))
+    t = t[np.isfinite(t["_key"])]
+    by_sample = {s: g.drop_duplicates("_key").set_index("_key")
+                 for s, g in t.groupby(t[sample_col].astype(str))}
+    out = []
+    for r in records:
+        if "cell_id" not in r:
+            print(f"  attach_cell_annotations: {r['sample']} has no per-cell ids "
+                  f"(unpaired sample) — not annotated")
+            out.append(r)
+            continue
+        ids = _id_floats(r["cell_id"])
+        sub = by_sample.get(str(r["sample"]))
+        if sub is None:
+            print(f"  attach_cell_annotations: {r['sample']} has no rows in the table")
+            cm = {c: np.full(ids.size, None, object) for c in columns}
+        else:
+            cm = {c: sub[c].reindex(ids).to_numpy(object) for c in columns}
+            hit = np.isin(ids, sub.index.to_numpy(float)).sum()
+            print(f"  attach_cell_annotations: {r['sample']}: {hit:,}/{ids.size:,} cells annotated")
+        out.append({**r, "cell_meta": {**(r.get("cell_meta") or {}), **cm}})
+    return out
+
+
+def split_by_cell_col(records, col, *, values=None) -> list:
+    """Split every annotated record (see attach_cell_annotations) into one record per value of the
+    per-cell column `col` — e.g. one per sickle class — so `col` becomes an ordinary sample-level
+    annotation that build_plan / compare_groups / cross_groups / replicate_summary / fold_change
+    can group, compare and test by. Each split record keeps the source sample's meta plus
+    meta[col] = its value, is named "<sample> [<value>]", and carries `split_from` = the source
+    sample. Cells with a blank value are dropped. `values`: which values to keep, in order
+    (default: every value, in first-seen order). Records without `cell_meta[col]` are skipped.
+    For plotting only — don't pass split records to export_processed."""
+    out = []
+    for r in records:
+        cm = (r.get("cell_meta") or {}).get(col)
+        if cm is None:
+            print(f"  split_by_cell_col: {r['sample']} has no '{col}' per-cell values — skipped")
+            continue
+        labels = [None if _is_blank(v) else (v.strip() if isinstance(v, str) else v) for v in cm]
+        present = list(dict.fromkeys(v for v in labels if v is not None))
+        for v in (values if values is not None else present):
+            keep = np.array([lab == v for lab in labels], bool)
+            if not keep.any():
+                continue
+            nr = _mask_record(r, keep)
+            nr["sample"] = f"{r['sample']} [{v}]"
+            nr["meta"] = {**r["meta"], col: v}
+            nr["split_from"] = r["sample"]
+            nr["cell_counts"] = [_cell_count(f"paired, {col}={v}", None, int(keep.sum()),
+                                             list(r["props"]))]
+            out.append(nr)
     return out
 
 
@@ -1140,6 +1265,8 @@ def draw_ridge(ax, arrays, labels, colors, xlabel, overlap: float = 1.7) -> None
     """Ridge plot of per-row histograms (shared bins, max-normalized), stacked top-down."""
     lo = min(v.min() for v in arrays)
     hi = max(v.max() for v in arrays)
+    if hi <= lo:                      # every value identical: give the bins a width
+        lo, hi = lo - 0.5, hi + 0.5
     bins = np.linspace(lo, hi, 41)
     n = len(arrays)
     for i, (vals, c) in enumerate(zip(arrays, colors)):
@@ -1350,12 +1477,17 @@ def plot_grouped(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=N
 
 def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=None,
                    kinds=("box", "ridge"), agg="per_sample", colors=None, time_col=None,
-                   label_exclude=None) -> None:
+                   label_exclude=None, stats_ref=None, n_boot=500) -> None:
     """COMPARISON across the values of `group_col`. agg='per_sample' (default) draws one box/ridge
     row per sample, colored by its group value and separated by group; agg='pool' pools all cells
     per group value into a single box/ridge row. Both a box and a ridge are produced by default.
     `label_exclude`: extra annotation columns to leave out of the per-box tick label beyond
     `group_col` itself (used by cross_groups, whose synthetic group_col already encodes them).
+    `stats_ref`: the reference (control) value of `group_col` — annotates the box plot above each
+    group with its comparison to it (see compare_to_reference: % change in median [95% CI],
+    Cliff's delta, BH-adjusted p). Only when the comparison has a single stratum (no other
+    annotation column crossed with `group_col`); otherwise the stratified stats live on the
+    replicate_summary / fold_change figures and a note is printed.
     Files: {datatype}_{prop}_{kind}_by_{group_col}.png"""
     recs = _with_prop(records, prop)
     if not recs:
@@ -1368,11 +1500,12 @@ def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles
         return
 
     if agg == "pool":
-        arrays, labels, cols = [], [], []
+        arrays, labels, cols, pos_vals = [], [], [], []
         for v in values:
             pooled = np.concatenate([r["props"][prop] for r in recs if rget(r, group_col) == v])
             if len(pooled) == 0:
                 continue
+            pos_vals.append(v)
             arrays.append(pooled)
             labels.append(value_label(group_col, v, roles))
             cols.append(colors.get(v, FALLBACK_COLOR))
@@ -1389,19 +1522,38 @@ def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles
         box_labels = [_leftover_label(r, roles, box_exclude) for r in sub]
         cols = [colors.get(rget(r, group_col), FALLBACK_COLOR) for r in sub]
         sep_keys = [rget(r, group_col) for r in sub]
+        pos_vals = sep_keys
         handles = [Patch(facecolor=colors.get(v, FALLBACK_COLOR),
                          label=value_label(group_col, v, roles)) for v in values]
     if not arrays:
         return
+
+    stat_rows = None
+    if stats_ref is not None and "box" in kinds:
+        res = compare_to_reference(recs, prop, group_col, stats_ref, roles=roles, n_boot=n_boot)
+        if res["strata_cols"]:
+            print(f"  compare_groups({prop}, {group_col}): stats are stratified by "
+                  f"{res['strata_cols']} — shown on the repsummary / foldchange figures, "
+                  f"not on this box plot")
+        else:
+            stat_rows = {row["group"]: row for row in res["rows"]}
 
     title = f"{datatype} {prop} — by {group_col}"
     if "box" in kinds:
         fig, ax = plt.subplots(figsize=(max(5, len(arrays) * 0.9), 5))
         draw_boxes(ax, arrays, box_labels, cols, ylabel,
                    sep_keys=sep_keys, sep_label_fn=(lambda v: str(v)) if sep_keys else None)
+        if stat_rows:
+            centers = {}
+            for i, v in enumerate(pos_vals):
+                centers.setdefault(v, []).append(i)
+            _annotate_stats(ax, {float(np.mean(ix)): stat_rows.get(v)
+                                 for v, ix in centers.items()})
         if handles:
             place_legend(ax, handles=handles)
-        ax.set_title(title)
+        ax.set_title(title + (f"\n{_STATS_CAPTION.format(ref=value_label(group_col, stats_ref, roles))}"
+                              if stat_rows else ""),
+                     fontsize=10 if stat_rows else None)
         _save(fig, f"{datatype}_{prop}_box_by_{group_col}.png", fig_dir)
     if "ridge" in kinds:
         fig, ax = plt.subplots(figsize=(9, max(3, len(arrays) * 0.55)))
@@ -1412,9 +1564,33 @@ def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles
         _save(fig, f"{datatype}_{prop}_ridge_by_{group_col}.png", fig_dir)
 
 
+_SPREAD_LABELS = {"cv": "CV (%)", "rcv": "IQR / median (%)", "sd": "SD", "iqr": "IQR"}
+
+
+def _spread(a, how) -> float:
+    """Within-sample spread of one sample's cells: 'cv' = SD/mean×100, 'rcv' (robust) =
+    IQR/median×100, 'sd', 'iqr'."""
+    a = np.asarray(a, float)
+    if a.size < 2:
+        return np.nan
+    if how == "cv":
+        return np.std(a, ddof=1) / np.mean(a) * 100 if np.mean(a) else np.nan
+    q1, med, q3 = np.percentile(a, [25, 50, 75])
+    if how == "rcv":
+        return (q3 - q1) / med * 100 if med else np.nan
+    if how == "sd":
+        return float(np.std(a, ddof=1))
+    if how == "iqr":
+        return float(q3 - q1)
+    raise ValueError(f"unknown spread {how!r} (use 'cv', 'rcv', 'sd', 'iqr' or None)")
+
+
 def timecourse_by(records, prop, ylabel, datatype, fig_dir, *, time_col=None, roles=None,
-                  series_col=None, colors=None) -> None:
+                  series_col=None, colors=None, spread="cv") -> None:
     """Timecourse of per-sample means vs a unit-aware time axis, colored by `series_col`.
+    `spread` adds a lower panel with each sample's within-sample spread on the same time axis
+    (heterogeneity often changes before the mean does): 'cv' (SD/mean, %, default), 'rcv'
+    (IQR/median, %), 'sd', 'iqr', or None for the mean panel alone.
     Files: {datatype}_{prop}_timecourse[_{series_col}].png"""
     recs = _with_prop(records, prop)
     if not recs:
@@ -1427,7 +1603,7 @@ def timecourse_by(records, prop, ylabel, datatype, fig_dir, *, time_col=None, ro
     conv = trole.get("to_hours") or (lambda v: float(v))
     colors = colors or (color_map_for(records, series_col, roles) if series_col else {})
 
-    series = {}
+    series, spreads = {}, {}
     for r in recs:
         try:
             x = conv(rget(r, time_col))
@@ -1435,9 +1611,20 @@ def timecourse_by(records, prop, ylabel, datatype, fig_dir, *, time_col=None, ro
             continue
         key = rget(r, series_col) if series_col else "all"
         series.setdefault(key, []).append((x, r["props"][prop].mean()))
+        if spread:
+            spreads.setdefault(key, []).append((x, _spread(r["props"][prop], spread)))
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    draw_timecourse(ax, series, colors, "Time (h)", ylabel)
+    if spread:
+        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(8, 7), sharex=True,
+                                      gridspec_kw=dict(height_ratios=[2, 1], hspace=0.08))
+        draw_timecourse(ax, series, colors, "", ylabel)
+        draw_timecourse(ax2, spreads, colors, "Time (h)", f"{_SPREAD_LABELS[spread]}")
+        if ax2.get_legend() is not None:
+            ax2.get_legend().remove()      # same series as the top panel's legend
+        ax2.set_title("within-sample spread", fontsize=8, loc="left")
+    else:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        draw_timecourse(ax, series, colors, "Time (h)", ylabel)
     suffix = f"_{series_col}" if series_col else ""
     ax.set_title(f"{datatype} {prop} — timecourse" + (f" by {series_col}" if series_col else ""))
     _save(fig, f"{datatype}_{prop}_timecourse{suffix}.png", fig_dir)
@@ -1800,6 +1987,445 @@ def grid_heatmap(records, prop, label, datatype, fig_dir, *, cols, roles=None, a
 
 
 # ---------------------------------------------------------------------------
+# Statistics vs a reference (control) group — replicate-aware
+# ---------------------------------------------------------------------------
+# The unit of replication is the SAMPLE, not the cell: with thousands of cells any cell-level test
+# is "significant". So each sample is reduced to its quantiles (median etc.), a group's value is
+# the mean of its samples' values, and uncertainty comes from a hierarchical bootstrap (resample
+# samples, and cells within each sample). Comparisons are made WITHIN strata: any other annotation
+# column genuinely crossed with the grouping column (e.g. time when every drug was sampled at every
+# time) splits the comparison, so a group is only compared to the reference at the same stratum.
+_STAT_ROLES = ("boolean", "categorical", "ordered", "time")
+STAT_QUANTILES = np.round(np.linspace(0.1, 0.9, 9), 2)   # deciles 10..90 (index 4 = median)
+_MEDIAN_I = 4
+_BOOT_CACHE = {}
+_CONTROL_HINT = re.compile(r"(?i)(dmso|ctrl|control|vehicle|untreated|untx|mock|no[-_ ]?drug|"
+                           r"^none$|^wt$|wild[-_ ]?type|^naive$|^baseline$|^pbs$)")
+_STATS_CAPTION = ("vs {ref}: % change in median [95% CI] · Cliff's δ · BH-adj. Welch p "
+                  "(per-sample medians)")
+_scipy_warned = False
+
+
+def suggest_references(records, roles=None, cols=None) -> dict:
+    """A GUESS at the reference (control) value of each grouping column, for the user to confirm
+    into the driver's REFERENCES — never applied automatically. boolean → the falsey value;
+    ordered → the lowest value (e.g. dose 0); categorical → a value named like a control (dmso,
+    control, ctrl, vehicle, untreated, mock, wt, …), else None (ask the user)."""
+    roles = roles or infer_roles(records)
+    cols = cols if cols is not None else [c for c, i in roles.items()
+                                         if i["role"] in ("boolean", "categorical", "ordered")]
+    out = {}
+    for c in cols:
+        info = roles.get(c) or _role_for(records, c, roles)
+        vals = group_order(records, c, roles)
+        if len(vals) < 2:
+            continue
+        if info["role"] in ("boolean", "ordered"):
+            out[c] = vals[0]
+        else:
+            out[c] = next((v for v in vals if _CONTROL_HINT.search(str(v))), None)
+    return out
+
+
+def _match_value(records, col, value):
+    """The value of `col` present in `records` that `value` names (exact, numeric or
+    case-insensitive match), so REFERENCES={"dose_uM": 0} finds 0.0 and "No" finds "no"."""
+    present = group_order(records, col)
+    for v in present:
+        if v == value:
+            return v
+    for v in present:
+        try:
+            if float(v) == float(value):
+                return v
+        except (TypeError, ValueError):
+            pass
+        if str(v).strip().lower() == str(value).strip().lower():
+            return v
+    raise ValueError(f"reference {value!r} is not a value of '{col}' (values: {present})")
+
+
+def strata_cols(records, group_col, roles=None) -> list:
+    """Other annotation columns (boolean / categorical / ordered / time) genuinely CROSSED with
+    `group_col` — more distinct (group, value) combos than either has levels — so a fair
+    comparison holds them fixed. A column nested in / confounded with `group_col` (e.g. a dose
+    that only the drug samples have) or constant is not a stratum."""
+    roles = roles or infer_roles(records)
+    out = []
+    for c, info in roles.items():
+        if c == group_col or info["role"] not in _STAT_ROLES:
+            continue
+        pairs = {(rget(r, group_col), rget(r, c)) for r in records
+                 if rget(r, group_col) is not None and rget(r, c) is not None}
+        ng, nc = len({a for a, _ in pairs}), len({b for _, b in pairs})
+        if nc >= 2 and len(pairs) > max(ng, nc):
+            out.append(c)
+    return out
+
+
+def _stratum_label(key, scols, roles) -> str:
+    return " | ".join(value_label(c, v, roles) for c, v in zip(scols, key)) if scols else "all"
+
+
+def _positions(recs, group_col, scols, roles, ref=None) -> list:
+    """[(stratum_key, group_value, [records])] in plotting order: strata in role order, and
+    within each stratum the reference first, then the groups in role order."""
+    pos = {}
+    for r in sort_records(recs, list(scols) + [group_col], roles):
+        pos.setdefault(tuple(rget(r, c) for c in scols), {}).setdefault(
+            rget(r, group_col), []).append(r)
+    out = []
+    for key, groups in pos.items():
+        order = list(groups)
+        if ref is not None and ref in groups:
+            order = [ref] + [g for g in order if g != ref]
+        out += [(key, g, groups[g]) for g in order]
+    return out
+
+
+def _sample_boot(sample, prop, a, n_boot, seed):
+    """(point quantiles, (n_boot, nq) bootstrap quantiles) of one sample's cells, cached so the
+    several stats figures of a run share one bootstrap per (sample, prop)."""
+    key = (sample, prop, a.size, float(np.sum(a)), n_boot, seed)
+    if key not in _BOOT_CACHE:
+        rng = np.random.default_rng([seed, a.size, zlib.crc32(f"{sample}|{prop}".encode())])
+        boots = np.empty((n_boot, STAT_QUANTILES.size))
+        chunk = max(1, min(n_boot, 2_000_000 // max(a.size, 1)))
+        for s0 in range(0, n_boot, chunk):
+            k = min(chunk, n_boot - s0)
+            idx = rng.integers(0, a.size, (k, a.size))
+            boots[s0:s0 + k] = np.quantile(a[idx], STAT_QUANTILES, axis=1).T
+        _BOOT_CACHE[key] = (np.quantile(a, STAT_QUANTILES), boots)
+    return _BOOT_CACHE[key]
+
+
+def cliffs_delta(x, y) -> float:
+    """Cliff's delta P(X > Y) − P(X < Y) between two cell populations, in O(n log n). −1..1;
+    |δ| ≈ 0.15 small, 0.33 medium, 0.47 large."""
+    x, y = np.asarray(x, float), np.sort(np.asarray(y, float))
+    if not x.size or not y.size:
+        return np.nan
+    less = np.searchsorted(y, x, "left").sum()              # pairs with y < x
+    greater = (y.size - np.searchsorted(y, x, "right")).sum()   # pairs with y > x
+    return float((less - greater) / (x.size * y.size))
+
+
+def _bh(p) -> np.ndarray:
+    """Benjamini–Hochberg adjusted p-values (NaNs pass through)."""
+    p = np.asarray(p, float)
+    out = np.full(p.size, np.nan)
+    ok = np.flatnonzero(np.isfinite(p))
+    if ok.size:
+        order = ok[np.argsort(p[ok])]
+        ranked = p[order] * ok.size / np.arange(1, ok.size + 1)
+        out[order] = np.minimum(1, np.minimum.accumulate(ranked[::-1])[::-1])
+    return out
+
+
+def _welch_p(a, b):
+    """(p, test name) of Welch's t-test between two sets of per-sample medians — on their logs
+    when all are positive (fold changes are ratios). NaN when either side has < 2 samples."""
+    global _scipy_warned
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if a.size < 2 or b.size < 2:
+        return np.nan, "n/a (<2 samples per side)"
+    try:
+        from scipy.stats import ttest_ind
+    except ImportError:
+        if not _scipy_warned:
+            print("  WARNING: scipy not installed — p-values skipped (conda install scipy)")
+            _scipy_warned = True
+        return np.nan, "n/a (no scipy)"
+    log = bool((a > 0).all() and (b > 0).all())
+    if log:
+        a, b = np.log(a), np.log(b)
+    if np.ptp(a) == 0 and np.ptp(b) == 0:
+        return np.nan, "n/a (no variance)"
+    p = float(ttest_ind(a, b, equal_var=False).pvalue)
+    return p, "Welch t on log per-sample medians" if log else "Welch t on per-sample medians"
+
+
+def compare_to_reference(records, prop, group_col, reference, *, roles=None, strata="auto",
+                         n_boot=500, seed=0) -> dict:
+    """Replicate-aware comparison of every value of `group_col` with the `reference` value, within
+    each stratum (strata="auto" → strata_cols; () → pool everything; or a list of columns).
+
+    Per (stratum, group): each sample → its deciles; the group's median = mean of its samples'
+    medians; 95% CIs from a hierarchical bootstrap (`n_boot` draws: resample samples, then cells
+    within each sample — with one sample the CI reflects cell sampling only). Against the
+    reference in the same stratum: % change in median [CI], decile shifts [CI] (quantile_shift),
+    Cliff's delta on the pooled cells (effect size), and Welch's t-test on the per-sample (log)
+    medians (needs >= 2 samples on each side), BH-adjusted across every comparison in the call.
+    Strata without a reference sample are skipped (listed in 'skipped').
+    Returns {rows, strata_cols, reference, skipped, quantiles}; stats_table(result) → DataFrame."""
+    recs = [r for r in _with_prop(records, prop) if rget(r, group_col) is not None]
+    if not recs:
+        return {"rows": [], "strata_cols": [], "reference": reference, "skipped": [],
+                "quantiles": STAT_QUANTILES}
+    roles = roles or infer_roles(records)
+    ref = _match_value(recs, group_col, reference)
+    scols = strata_cols(recs, group_col, roles) if strata == "auto" else list(strata or ())
+    rng = np.random.default_rng(seed)
+
+    by_key = {}
+    for key, g, rs in _positions(recs, group_col, scols, roles, ref):
+        by_key.setdefault(key, []).append((g, rs))
+    rows, skipped = [], []
+    for key, groups in by_key.items():
+        label = _stratum_label(key, scols, roles)
+        if groups[0][0] != ref:
+            skipped.append(label)
+            continue
+        summ = {}
+        for g, rs in groups:
+            arrs = [np.asarray(r["props"][prop], float) for r in rs]
+            pts, boots = zip(*(_sample_boot(r["sample"], prop, a, n_boot, seed)
+                               for r, a in zip(rs, arrs)))
+            stack = np.stack(boots)                                    # (m, B, nq)
+            m = len(rs)
+            pick = rng.integers(0, m, (n_boot, m))
+            gboot = stack[pick, np.arange(n_boot)[:, None], :].mean(axis=1)   # (B, nq)
+            meds = np.array([q[_MEDIAN_I] for q in pts])
+            summ[g] = dict(samples=[r["sample"] for r in rs], medians=meds,
+                           q=np.mean(pts, axis=0), boot=gboot, cells=np.concatenate(arrs),
+                           cv=np.nanmean([_spread(a, "cv") for a in arrs]))
+        R = summ[ref]
+        for g, _ in groups:
+            S = summ[g]
+            row = {"prop": prop, "group_col": group_col, "stratum": label, "group": g,
+                   "reference": ref, "is_ref": g == ref, "n_samples": len(S["samples"]),
+                   "n_cells": int(S["cells"].size), "median": float(S["q"][_MEDIAN_I]),
+                   "sd_between_samples": float(np.std(S["medians"], ddof=1))
+                   if S["medians"].size > 1 else np.nan,
+                   "cv_cells_pct": float(S["cv"]),
+                   "samples": "; ".join(map(str, S["samples"])),
+                   "_key": key, "_medians": S["medians"]}
+            if g != ref:
+                ratio = S["boot"][:, _MEDIAN_I] / R["boot"][:, _MEDIAN_I]
+                shift = S["boot"] - R["boot"]
+                p, test = _welch_p(S["medians"], R["medians"])
+                row.update({
+                    "pct_change": (S["q"][_MEDIAN_I] / R["q"][_MEDIAN_I] - 1) * 100,
+                    "pct_lo": (np.percentile(ratio, 2.5) - 1) * 100,
+                    "pct_hi": (np.percentile(ratio, 97.5) - 1) * 100,
+                    "cliffs_delta": cliffs_delta(S["cells"], R["cells"]),
+                    "p": p, "test": test,
+                    "_shift": S["q"] - R["q"],
+                    "_shift_lo": np.percentile(shift, 2.5, axis=0),
+                    "_shift_hi": np.percentile(shift, 97.5, axis=0)})
+            rows.append(row)
+    cmp_rows = [r for r in rows if not r["is_ref"]]
+    for r, q in zip(cmp_rows, _bh([r["p"] for r in cmp_rows])):
+        r["p_adj"] = q
+    if skipped:
+        print(f"  compare_to_reference({prop}, {group_col}): no '{ref}' sample in stratum "
+              f"{', '.join(skipped)} — not compared there")
+    return {"rows": rows, "strata_cols": scols, "reference": ref, "skipped": skipped,
+            "quantiles": STAT_QUANTILES}
+
+
+def stats_table(result) -> pd.DataFrame:
+    """compare_to_reference output as a flat DataFrame (internal arrays dropped)."""
+    cols = ["prop", "group_col", "stratum", "group", "reference", "is_ref", "n_samples", "n_cells",
+            "median", "sd_between_samples", "cv_cells_pct", "pct_change", "pct_lo", "pct_hi",
+            "cliffs_delta", "p", "p_adj", "test", "samples"]
+    return pd.DataFrame([{c: r.get(c) for c in cols} for r in result["rows"]], columns=cols)
+
+
+def _pct(v) -> str:
+    if v is None or not np.isfinite(v):
+        return "n/a"
+    return f"{v:+.1f}" if abs(v) >= 1 else f"{v:+.2f}"
+
+
+def _fmt_p(p) -> str:
+    if p is None or not np.isfinite(p):
+        return "p n/a"
+    return "p<0.001" if p < 0.001 else f"p={p:.2g}"
+
+
+def _stat_text(row) -> str:
+    if row is None:
+        return ""
+    if row["is_ref"]:
+        return "ref"
+    return (f"{_pct(row['pct_change'])}%\n[{_pct(row['pct_lo'])}, {_pct(row['pct_hi'])}]\n"
+            f"δ={row['cliffs_delta']:+.2f}\n{_fmt_p(row.get('p_adj'))}")
+
+
+def _annotate_stats(ax, at: dict) -> None:
+    """Write each comparison's stats text at the top of the axes, centered on x (a {x: row} map),
+    after adding headroom so it sits above the data."""
+    y0, y1 = ax.get_ylim()
+    ax.set_ylim(y0, y1 + (y1 - y0) * 0.32)
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+    for x, row in at.items():
+        txt = _stat_text(row)
+        if txt:
+            ax.text(x, 0.985, txt, transform=trans, ha="center", va="top", fontsize=6.5,
+                    color="black" if txt != "ref" else _N_COLOR, linespacing=1.1)
+
+
+def _stats_path(fig_dir, datatype, prop, group_col) -> Path:
+    d = Path(fig_dir) / "stats"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{datatype}_{prop}_stats_by_{group_col}.csv"
+
+
+def replicate_summary(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=None,
+                      reference=None, strata="auto", colors=None, max_cells=400, n_boot=500,
+                      seed=0) -> None:
+    """Replicate-aware comparison across `group_col`: one position per (stratum, group) — see
+    strata_cols — with every sample's median as a dot, the mean ± SD of those medians as a black
+    bar, and a faint cloud of up to `max_cells` cells per sample behind. With `reference` (the
+    control value of group_col), each group is annotated with its comparison to the reference in
+    the same stratum (compare_to_reference) and the stats table is written to
+    <fig_dir>/stats/{datatype}_{prop}_stats_by_{group_col}.csv. Strata are the bold labels under
+    the axis; ticks show only the group value and its sample count.
+    File: {datatype}_{prop}_repsummary_by_{group_col}.png"""
+    recs = [r for r in _with_prop(records, prop) if rget(r, group_col) is not None]
+    if not recs:
+        return
+    roles = roles or infer_roles(records)
+    colors = colors or color_map_for(records, group_col, roles)
+    res, ref = None, None
+    if reference is not None:
+        res = compare_to_reference(recs, prop, group_col, reference, roles=roles, strata=strata,
+                                   n_boot=n_boot, seed=seed)
+        scols, ref = res["strata_cols"], res["reference"]
+        stats_table(res).to_csv(_stats_path(fig_dir, datatype, prop, group_col), index=False)
+    else:
+        scols = strata_cols(recs, group_col, roles) if strata == "auto" else list(strata or ())
+    positions = _positions(recs, group_col, scols, roles, ref)
+    row_at = {(row["_key"], row["group"]): row for row in res["rows"]} if res else {}
+    rng = np.random.default_rng(seed)
+
+    fig, ax = plt.subplots(figsize=(max(5, 0.95 * len(positions) + 1.5), 5.5))
+    for i, (key, g, rs) in enumerate(positions):
+        c = colors.get(g, FALLBACK_COLOR)
+        meds = []
+        for r in rs:
+            a = np.asarray(r["props"][prop], float)
+            shown = a if a.size <= max_cells else rng.choice(a, max_cells, replace=False)
+            ax.scatter(i + rng.uniform(-0.28, 0.28, shown.size), shown, color=c, alpha=0.08,
+                       s=4, linewidths=0, zorder=1, rasterized=True)
+            meds.append(np.median(a))
+        meds = np.asarray(meds)
+        xs = i + (np.linspace(-0.12, 0.12, meds.size) if meds.size > 1 else np.zeros(1))
+        ax.scatter(xs, meds, s=38, color=c, edgecolor="black", linewidths=0.8, zorder=4)
+        ax.hlines(meds.mean(), i - 0.3, i + 0.3, color="black", lw=2, zorder=5)
+        if meds.size > 1:
+            ax.errorbar(i, meds.mean(), yerr=np.std(meds, ddof=1), color="black", capsize=5,
+                        lw=1.2, zorder=5)
+    ax.set_xticks(range(len(positions)))
+    ax.set_xticklabels([f"{value_label(group_col, g, roles)} (n={len(rs)})"
+                        for _, g, rs in positions], fontsize=7, rotation=45, ha="right")
+    ax.set_xlim(-0.5, len(positions) - 0.5)
+    ax.set_ylabel(ylabel)
+    if scols:
+        keys = [k for k, _, _ in positions]
+        _run_separators(ax, keys, lambda k: _stratum_label(k, scols, roles))
+    if res:
+        _annotate_stats(ax, {i: row_at.get((k, g)) for i, (k, g, _) in enumerate(positions)})
+    sub = ("dots = per-sample medians, bar = mean ± SD across samples, faint = cells "
+           f"(≤{max_cells}/sample); n = samples")
+    if res:
+        sub += "\n" + _STATS_CAPTION.format(ref=value_label(group_col, ref, roles))
+    ax.set_title(f"{datatype} {prop} — replicates by {group_col}\n{sub}", fontsize=9)
+    _save(fig, f"{datatype}_{prop}_repsummary_by_{group_col}.png", fig_dir)
+
+
+def fold_change(records, prop, ylabel, datatype, fig_dir, *, group_col, reference, roles=None,
+                strata="auto", colors=None, n_boot=500, seed=0) -> None:
+    """Forest plot of the % change in median vs the `reference` value of `group_col` (within each
+    stratum), with 95% hierarchical-bootstrap CIs; Cliff's δ and the BH-adjusted p at the right.
+    Also writes the stats table to <fig_dir>/stats/{datatype}_{prop}_stats_by_{group_col}.csv.
+    File: {datatype}_{prop}_foldchange_by_{group_col}.png"""
+    res = compare_to_reference(records, prop, group_col, reference, roles=roles, strata=strata,
+                               n_boot=n_boot, seed=seed)
+    rows = [r for r in res["rows"] if not r["is_ref"]]
+    if not rows:
+        return
+    stats_table(res).to_csv(_stats_path(fig_dir, datatype, prop, group_col), index=False)
+    roles = roles or infer_roles(records)
+    colors = colors or color_map_for(records, group_col, roles)
+    scols, ref = res["strata_cols"], res["reference"]
+    n = len(rows)
+    fig, ax = plt.subplots(figsize=(8.5, max(2.6, 0.42 * n + 1.6)))
+    for i, row in enumerate(rows):
+        y = n - 1 - i
+        c = colors.get(row["group"], FALLBACK_COLOR)
+        lo, hi = row["pct_change"] - row["pct_lo"], row["pct_hi"] - row["pct_change"]
+        ax.errorbar(row["pct_change"], y, xerr=[[max(lo, 0)], [max(hi, 0)]], fmt="o", color=c,
+                    ms=7, mec="black", mew=0.6, capsize=3, lw=1.5)
+    ax.axvline(0, color=_N_COLOR, ls="--", lw=1, zorder=0)
+    ax.set_yticks([n - 1 - i for i in range(n)])
+    ax.set_yticklabels([(f"{row['stratum']}  ·  " if scols else "")
+                        + f"{value_label(group_col, row['group'], roles)} (n={row['n_samples']})"
+                        for row in rows], fontsize=8)
+    ax.set_ylim(-0.7, n - 0.3)
+    trans = blended_transform_factory(ax.transAxes, ax.transData)
+    for i, row in enumerate(rows):
+        ax.text(1.02, n - 1 - i, f"δ={row['cliffs_delta']:+.2f}  {_fmt_p(row.get('p_adj'))}",
+                transform=trans, ha="left", va="center", fontsize=7.5, clip_on=False)
+    ax.set_xlabel(f"% change in median vs {value_label(group_col, ref, roles)} — {ylabel}")
+    note = (f"\nno {ref} sample in: {', '.join(res['skipped'])}" if res["skipped"] else "")
+    ax.set_title(f"{datatype} {prop} — vs {value_label(group_col, ref, roles)}, by {group_col}"
+                 f"\nmean of per-sample medians, 95% hierarchical bootstrap CI; n = samples; "
+                 f"BH-adj. Welch p on per-sample medians{note}", fontsize=9)
+    _save(fig, f"{datatype}_{prop}_foldchange_by_{group_col}.png", fig_dir)
+
+
+def quantile_shift(records, prop, ylabel, datatype, fig_dir, *, group_col, reference, roles=None,
+                   strata="auto", colors=None, n_boot=500, seed=0, ncols=4) -> None:
+    """Shift-function plot: for each group, the difference from the `reference` at every decile
+    (10th..90th percentile; each = mean over samples of that sample's decile) with a 95%
+    hierarchical-bootstrap band — one panel per stratum. A flat line = the whole distribution
+    moved; a sloped line = only the low or high tail changed (e.g. only the large cells grew).
+    File: {datatype}_{prop}_qshift_by_{group_col}.png"""
+    res = compare_to_reference(records, prop, group_col, reference, roles=roles, strata=strata,
+                               n_boot=n_boot, seed=seed)
+    rows = [r for r in res["rows"] if not r["is_ref"]]
+    if not rows:
+        return
+    roles = roles or infer_roles(records)
+    colors = colors or color_map_for(records, group_col, roles)
+    scols, ref = res["strata_cols"], res["reference"]
+    panels = list(dict.fromkeys(r["stratum"] for r in rows))
+    nc = min(len(panels), ncols)
+    nr = int(np.ceil(len(panels) / nc))
+    fig, axes = plt.subplots(nr, nc, figsize=(nc * 3.8 + 1.5, nr * 3.3), squeeze=False,
+                             sharey=True)
+    x = res["quantiles"] * 100
+    groups = []
+    for k, label in enumerate(panels):
+        ax = axes[k // nc][k % nc]
+        for row in (r for r in rows if r["stratum"] == label):
+            c = colors.get(row["group"], FALLBACK_COLOR)
+            ax.fill_between(x, row["_shift_lo"], row["_shift_hi"], color=c, alpha=0.18, lw=0)
+            ax.plot(x, row["_shift"], color=c, marker="o", ms=3.5, lw=1.6)
+            if row["group"] not in groups:
+                groups.append(row["group"])
+        ax.axhline(0, color=_N_COLOR, ls="--", lw=1, zorder=0)
+        ax.set_xticks([10, 30, 50, 70, 90])
+        if scols:
+            ax.set_title(label, fontsize=9)
+        if k % nc == 0:
+            ax.set_ylabel(f"Δ vs {value_label(group_col, ref, roles)}\n{ylabel}", fontsize=8)
+        if k // nc == nr - 1:
+            ax.set_xlabel("Percentile")
+    for k in range(len(panels), nr * nc):
+        axes[k // nc][k % nc].axis("off")
+    handles = [Line2D([], [], color=colors.get(g, FALLBACK_COLOR), marker="o",
+                      label=value_label(group_col, g, roles)) for g in groups]
+    place_legend(axes[0][nc - 1], handles=handles)
+    fig.suptitle(f"{datatype} {prop} — decile shift vs {value_label(group_col, ref, roles)}, "
+                 f"by {group_col} (band = 95% hierarchical bootstrap CI)", fontsize=10)
+    fig.tight_layout()
+    _save(fig, f"{datatype}_{prop}_qshift_by_{group_col}.png", fig_dir)
+
+
+# ---------------------------------------------------------------------------
 # Cell counts per sample — before gating / after gating / after outlier rejection
 # ---------------------------------------------------------------------------
 def cell_count_rows(records) -> list:
@@ -1852,6 +2478,196 @@ def render_cell_counts(records, title="Cells per sample") -> str:
     lines += ["| " + " | ".join(cells) + " |" for cells in body]
     lines.append(caption)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# QC deck — cell-count waterfall, acquisition-order drift, pairing confidence. Not in build_plan:
+# the driver runs qc_report by default into its own fig dir and deck (<exp>_qc_fig/ ->
+# <exp>_qc.pptx), beside the main and props-vs-time decks.
+# ---------------------------------------------------------------------------
+def qc_cell_counts(records, datatype, fig_dir, *, low_frac=0.5, max_rows=40) -> None:
+    """Waterfall of cells per sample: before gating (grey), after gating (blue), after outlier
+    rejection (orange; the smallest per-prop count) — the cell_count_rows numbers as bars, with the
+    fraction kept at the right. Samples keeping < `low_frac` of their cells are flagged in red.
+    More than `max_rows` rows continue in further figures.
+    Files: {datatype}_qc_cell_counts[_<k>].png"""
+    rows = cell_count_rows(records)
+    if not rows:
+        return
+    _, _, caption = _count_table(rows)
+    multi = {s for s in (r["sample"] for r in rows)
+             if sum(1 for q in rows if q["sample"] == s) > 1}
+    chunks = [rows[i:i + max_rows] for i in range(0, len(rows), max_rows)]
+    xmax = max(max(r["ungated"] or 0, r["gated"]) for r in rows) or 1
+    for k, chunk in enumerate(chunks, 1):
+        n = len(chunk)
+        fig, ax = plt.subplots(figsize=(10, 0.36 * n + 1.8))
+        y = np.arange(n)[::-1].astype(float)
+        h = 0.27
+        ung = np.array([r["ungated"] if r["ungated"] is not None else np.nan for r in chunk], float)
+        gat = np.array([r["gated"] for r in chunk], float)
+        aft = np.array([min(r["after"].values()) if r["after"] else r["gated"] for r in chunk],
+                       float)
+        if np.isfinite(ung).any():
+            ax.barh(y + h, np.nan_to_num(ung), h, color="#BBBBBB", label="before gating")
+        ax.barh(y, gat, h, color="#0072B2", label="after gating")
+        ax.barh(y - h, aft, h, color="#E69F00", label="after outlier rejection")
+        flagged = []
+        for yi, u, g, a in zip(y, ung, gat, aft):
+            base = u if np.isfinite(u) and u > 0 else g
+            frac = a / base if base else np.nan
+            bad = np.isfinite(frac) and frac < low_frac
+            flagged.append(bad)
+            ax.text(xmax * 1.01, yi, f"{frac:.0%} kept" if np.isfinite(frac) else "",
+                    va="center", fontsize=7, color="#D55E00" if bad else "black",
+                    fontweight="bold" if bad else "normal")
+        ax.set_yticks(y)
+        ax.set_yticklabels([f"{r['sample']}" + (f" [{r['block']}]" if r["sample"] in multi else "")
+                            for r in chunk], fontsize=7)
+        for lab, bad in zip(ax.get_yticklabels(), flagged):
+            if bad:
+                lab.set_color("#D55E00")
+        ax.set_xlim(0, xmax * 1.13)
+        ax.set_ylim(-0.6, n - 0.4)
+        ax.set_xlabel("Cells")
+        part = f" ({k}/{len(chunks)})" if len(chunks) > 1 else ""
+        ax.set_title(f"{datatype} cells per sample{part} — red: < {low_frac:.0%} kept\n{caption}",
+                     fontsize=9)
+        place_legend(ax, loc="lower right")
+        _save(fig, f"{datatype}_qc_cell_counts{f'_{k}' if len(chunks) > 1 else ''}.png", fig_dir)
+
+
+def qc_drift(records, datatype, fig_dir, *, props=None, prop_labels=None, roles=None,
+             order_col=None) -> None:
+    """Per-sample median (± IQR) of each prop in ACQUISITION order — the metadata row order, or
+    `order_col` (e.g. an acquisition timestamp / run index column) — to catch instrument drift
+    across the session. Samples sharing every annotation value (repeated conditions, typically a
+    control re-run through the session) are colored and connected, with their linear drift in % of
+    their mean per step in the legend; one-off samples are grey. One panel per prop.
+    File: {datatype}_qc_drift.png"""
+    roles = roles or infer_roles(records)
+    labels = {**dict(IFXM_PROPS), **dict(COULTER_PROPS), **(prop_labels or {})}
+    present = [p for p in (props or list(dict.fromkeys(k for r in records for k in r["props"])))
+               if any(len(r["props"].get(p, [])) for r in records)]
+    if not records or not present:
+        return
+    recs = list(records)
+    xs = np.arange(len(recs), dtype=float)
+    xlabel = "acquisition order (metadata row order)"
+    if order_col:
+        vals = _to_floats([rget(r, order_col) for r in recs])
+        if vals is not None and len(vals) == len(recs):
+            idx = np.argsort(vals, kind="stable")
+            recs = [recs[i] for i in idx]
+            xs = np.asarray(vals, float)[idx]
+        else:
+            recs = sort_records(recs, [order_col], roles)
+        xlabel = f"acquisition order ({order_col})"
+    set_cols = [c for c, i in roles.items() if i["role"] in _STAT_ROLES]
+    keys = [tuple(rget(r, c) for c in set_cols) for r in recs]
+    sets = {}
+    for i, k in enumerate(keys):
+        sets.setdefault(k, []).append(i)
+    repeated = {k: ix for k, ix in sets.items() if len(ix) > 1}
+    cmap = build_color_map(list(repeated))
+
+    def set_label(k):
+        return " | ".join(value_label(c, v, roles) for c, v in zip(set_cols, k)
+                          if v is not None) or "all samples"
+
+    fig, axes = plt.subplots(len(present), 1, figsize=(max(8, 0.3 * len(recs) + 4),
+                                                       2.9 * len(present)),
+                             sharex=True, squeeze=False)
+    for ax, p in zip(axes[:, 0], present):
+        med = np.full(len(recs), np.nan)
+        q1, q3 = med.copy(), med.copy()
+        for i, r in enumerate(recs):
+            a = np.asarray(r["props"].get(p, []), float)
+            if a.size:
+                q1[i], med[i], q3[i] = np.percentile(a, [25, 50, 75])
+        single = [i for i, k in enumerate(keys) if k not in repeated and np.isfinite(med[i])]
+        if single:
+            ax.errorbar(xs[single], med[single], yerr=[med[single] - q1[single],
+                                                       q3[single] - med[single]],
+                        fmt="o", color="#AAAAAA", ms=4, lw=0.8, capsize=2, zorder=2,
+                        label="one-off samples")
+        for k, ix in repeated.items():
+            ix = [i for i in ix if np.isfinite(med[i])]
+            if not ix:
+                continue
+            c = cmap[k]
+            ax.errorbar(xs[ix], med[ix], yerr=[med[ix] - q1[ix], q3[ix] - med[ix]], fmt="o",
+                        color=c, ms=5, lw=0.8, capsize=2, zorder=3)
+            lab = f"{set_label(k)} (n={len(ix)})"
+            if len(ix) >= 2 and np.ptp(xs[ix]) > 0 and np.mean(med[ix]):
+                slope = np.polyfit(xs[ix], med[ix], 1)[0]
+                lab += f"; {slope / np.mean(med[ix]) * 100:+.2f}%/step"
+            ax.plot(xs[ix], med[ix], color=c, lw=1.4, zorder=3, label=lab)
+        ax.set_ylabel(f"median {labels.get(p, p)}", fontsize=8)
+        place_legend(ax, fontsize=7)
+    ax = axes[-1, 0]
+    if not order_col and len(recs) <= 80:
+        ax.set_xticks(xs)
+        ax.set_xticklabels([str(r["sample"]) for r in recs], rotation=90, fontsize=6)
+    ax.set_xlabel(xlabel)
+    note = "" if repeated else " — no repeated conditions, nothing to connect"
+    axes[0, 0].set_title(f"{datatype} per-sample median ± IQR in acquisition order; repeated "
+                         f"conditions connected{note}", fontsize=10)
+    fig.tight_layout()
+    _save(fig, f"{datatype}_qc_drift.png", fig_dir)
+
+
+_QC_SCATTERS = (("density_confidence", "density"), ("mass_confidence_score", "mass"),
+                ("volume_confidence", "vol"))
+
+
+def qc_pair_confidence(paired_records, datatype, fig_dir, *, prop_labels=None) -> None:
+    """Pairing-confidence QC for iFXM paired samples (load_ifxm_paired records, which carry the
+    pair_ block's mass_confidence_score / volume_confidence / density_confidence row-aligned as
+    record['qc']): a ridge of each confidence across samples, and per-sample scatters of each
+    property vs its confidence (do low-confidence pairs drive the density tails?). Cells are the
+    plotted ones (gated, after outlier rejection).
+    Files: {datatype}_qc_{metric}_ridge.png, {datatype}_{prop}_vs_{metric}.png"""
+    recs = [r for r in paired_records if r.get("qc")]
+    if not recs:
+        print(f"  qc_pair_confidence: no pairing-confidence columns in the {datatype} records "
+              f"— skipped")
+        return
+    labels = {**dict(IFXM_PROPS), **(prop_labels or {})}
+    metrics = list(dict.fromkeys(m for r in recs for m in r["qc"]))
+    for m in metrics:
+        arrs, labs = [], []
+        for r in recs:
+            a = np.asarray(r["qc"].get(m, []), float)
+            a = a[np.isfinite(a)]
+            if a.size:
+                arrs.append(a)
+                labs.append(str(r["sample"]))
+        if not arrs:
+            continue
+        fig, ax = plt.subplots(figsize=(8, max(3, len(arrs) * 0.45)))
+        draw_ridge(ax, arrs, labs, ["#0072B2"] * len(arrs), m)
+        ax.set_title(f"{datatype} pairing QC — {m} per sample (plotted cells)")
+        _save(fig, f"{datatype}_qc_{m}_ridge.png", fig_dir)
+    for qm, p in _QC_SCATTERS:
+        aug = [{**r, "props": {**r["props"], qm: np.asarray(r["qc"][qm], float)}}
+               for r in recs if qm in r["qc"]
+               and np.asarray(r["qc"][qm]).size == np.asarray(r["props"].get(p, [])).size]
+        if aug:
+            scatter_by(aug, qm, p, qm, labels.get(p, p), datatype, fig_dir)
+
+
+def qc_report(records, datatype, fig_dir, *, paired_records=None, props=None, prop_labels=None,
+              roles=None, order_col=None, low_frac=0.5) -> None:
+    """Everything in the QC deck for one dataset: qc_cell_counts + qc_drift on `records` (the
+    records that fed the main deck, after reject_outliers), and qc_pair_confidence on
+    `paired_records` (iFXM load_ifxm_paired records) when given. Then
+    save_pptx(fig_dir, <exp>_qc.pptx)."""
+    qc_cell_counts(records, datatype, fig_dir, low_frac=low_frac)
+    qc_drift(records, datatype, fig_dir, props=props, prop_labels=prop_labels, roles=roles,
+             order_col=order_col)
+    if paired_records:
+        qc_pair_confidence(paired_records, datatype, fig_dir, prop_labels=prop_labels)
 
 
 # ---------------------------------------------------------------------------
@@ -2075,8 +2891,14 @@ def export_processed_cache(records, compiled_dir, out_pt) -> Path | None:
 # ---------------------------------------------------------------------------
 # High-level: infer a plot plan, show it, execute it
 # ---------------------------------------------------------------------------
+def _has_replicates(records, group_col, roles) -> bool:
+    """True when some (stratum, group) position of replicate_summary holds >= 2 samples."""
+    scols = strata_cols(records, group_col, roles)
+    return any(len(rs) > 1 for _, _, rs in _positions(records, group_col, scols, roles))
+
+
 def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
-               grid_pairs=None, include_ordered=True) -> dict:
+               grid_pairs=None, include_ordered=True, references=None) -> dict:
     """Infer a plot plan (list of PlotSpecs) from the column roles. For every boolean / categorical
     (and, if include_ordered, approved ordered) column: a plot_grouped + a compare_groups per prop.
     If a time column exists: a timecourse per prop, split by each grouping column. Scatters are
@@ -2087,7 +2909,13 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
     column pairs found by suggest_grids but not in grid_pairs are listed under
     'grid_suggestions' for render_plan to offer — never plotted by default. Returns
     {roles, props, plots:[{fn,prop,kwargs,rationale}], grid_suggestions, cell_counts} — the last
-    being render_cell_counts(records), which render_plan prints."""
+    being render_cell_counts(records), which render_plan prints.
+    Replicates & statistics: every grouping column whose (stratum, group) positions have >= 2
+    samples somewhere gets a replicate_summary. `references` = {group_col: control value}, the
+    user-CONFIRMED reference per grouping column; each one adds stats to that column's
+    replicate_summary and compare_groups box, plus a fold_change forest and a quantile_shift
+    plot. Unconfirmed guesses (suggest_references) are listed under 'reference_suggestions' for
+    render_plan to offer — never applied by default."""
     roles = roles or infer_roles(records)
     present = {k for r in records for k, v in r["props"].items() if len(v) > 0}
     props = [p for p in (props if props is not None else present) if p in present]
@@ -2096,14 +2924,37 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
     group_cols = [c for c, i in roles.items()
                   if i["role"] in ("boolean", "categorical")
                   or (include_ordered and i["role"] == "ordered")]
+    refs = {}
+    for gc, v in (references or {}).items():
+        if gc not in group_cols:
+            print(f"  build_plan: REFERENCES names '{gc}', which is not a grouping column "
+                  f"(role {roles.get(gc, {}).get('role', 'absent')}) — ignored")
+            continue
+        refs[gc] = _match_value(records, gc, v)     # raises if the value isn't present
+    reps = {gc: _has_replicates(records, gc, roles) for gc in group_cols}
 
     plots = []
     for prop in props:
         for gc in group_cols:
+            ref = refs.get(gc)
             plots.append({"fn": "plot_grouped", "prop": prop, "kwargs": {"group_col": gc},
                           "rationale": f"per-{gc} detail"})
-            plots.append({"fn": "compare_groups", "prop": prop, "kwargs": {"group_col": gc},
-                          "rationale": f"compare across {gc}"})
+            cg = {"group_col": gc, **({"stats_ref": ref} if ref is not None else {})}
+            plots.append({"fn": "compare_groups", "prop": prop, "kwargs": cg,
+                          "rationale": f"compare across {gc}"
+                                       + (f" (stats vs {ref})" if ref is not None else "")})
+            if reps[gc] or ref is not None:
+                plots.append({"fn": "replicate_summary", "prop": prop,
+                              "kwargs": {"group_col": gc, "reference": ref},
+                              "rationale": f"per-sample medians by {gc}"
+                                           + (f", stats vs {ref}" if ref is not None else "")})
+            if ref is not None:
+                plots.append({"fn": "fold_change", "prop": prop,
+                              "kwargs": {"group_col": gc, "reference": ref},
+                              "rationale": f"% change vs {ref} (forest, 95% CI)"})
+                plots.append({"fn": "quantile_shift", "prop": prop,
+                              "kwargs": {"group_col": gc, "reference": ref},
+                              "rationale": f"decile shift vs {ref}"})
         if time_col:
             plots.append({"fn": "timecourse_by", "prop": prop,
                           "kwargs": {"time_col": time_col, "series_col": None},
@@ -2130,7 +2981,11 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
                           "rationale": f"grid heatmap {kw['cols'][0]} × {kw['cols'][1]}"})
     suggestions = [s for s in suggest_grids(records, roles)
                    if frozenset(s["cols"]) not in confirmed]
+    ref_sugg = {gc: v for gc, v in suggest_references(records, roles, group_cols).items()
+                if gc not in refs}
     return {"roles": roles, "props": props, "plots": plots, "grid_suggestions": suggestions,
+            "references": refs, "reference_suggestions": ref_sugg,
+            "strata": {gc: strata_cols(records, gc, roles) for gc in group_cols},
             "cell_counts": render_cell_counts(records)}
 
 
@@ -2166,6 +3021,23 @@ def render_plan(plan) -> str:
                     for (a, b), n in s["repeats"].items())
             lines.append(f"  - {x} × {y}: {nx}×{ny} grid, {s['filled']}/{nx * ny} combos "
                          f"filled{rep}")
+    refs, rsugg = plan.get("references") or {}, plan.get("reference_suggestions") or {}
+    if refs or rsugg:
+        lines.append("")
+        lines.append("Statistics reference (control) per grouping column — stats only for "
+                     "confirmed ones (REFERENCES):")
+        strata = plan.get("strata") or {}
+        for gc in list(refs) + [c for c in rsugg if c not in refs]:
+            st = strata.get(gc)
+            st_txt = f"; compared within {' × '.join(st)}" if st else ""
+            if gc in refs:
+                lines.append(f"  - {gc}: reference = {refs[gc]!r} (stats ON{st_txt})")
+            elif rsugg[gc] is not None:
+                lines.append(f"  - {gc}: suggested reference = {rsugg[gc]!r} — NOT applied; "
+                             f"confirm into REFERENCES{st_txt}")
+            else:
+                lines.append(f"  - {gc}: no obvious control — ask the user which value (if any) "
+                             f"is the reference{st_txt}")
     if plan.get("cell_counts"):
         lines.append("")
         lines.append(plan["cell_counts"])
@@ -2183,7 +3055,9 @@ def autoplot(records, plan, datatype, fig_dir, prop_labels=None, paired_records=
     if _COMBINATORS is None:
         _COMBINATORS = {"plot_grouped": plot_grouped, "compare_groups": compare_groups,
                         "timecourse_by": timecourse_by, "scatter_by": scatter_by,
-                        "facet": facet, "grid_heatmap": grid_heatmap}
+                        "facet": facet, "grid_heatmap": grid_heatmap,
+                        "replicate_summary": replicate_summary, "fold_change": fold_change,
+                        "quantile_shift": quantile_shift}
     labels = prop_labels or {}
     roles = plan["roles"]
     warned = False

@@ -32,6 +32,12 @@ any sample with has_gate = False (compiled ungated) or an unusually large drop. 
 - `GRID_PAIRS`: `[...]` (show_repeats?) — or none
 - Cross-products (`cross_groups`), facets, hand-rolled figures: …
 - Props-vs-time deck (`<EXP_NAME>_props_vs_time.pptx`): samples, props, trend — or skipped (why)
+- Statistics: `REFERENCES` = `{...}` (or none — declined); strata each comparison was made within;
+  method: per-sample medians, hierarchical bootstrap 95% CI, Welch p on (log) per-sample medians
+  (BH-adjusted), Cliff's δ on cells; tables in `<EXP_NAME>_fig/stats/`
+- `CELL_SPLIT`: `{sheet, col, reference}` — or none
+- QC deck (`<EXP_NAME>_qc.pptx`): `QC_ORDER_COL` (or metadata row order); samples flagged
+  (< 50% kept) and any repeated condition with visible drift
 - Processed data (`processed_data/<EXP_NAME>_processed.xlsx`): plotted iFXM cells, per sample — or skipped (why)
 - Cropped image cache (`processed_data/<EXP_NAME>_vqvae_cache.pt` + `_metadata.parquet`): yes (crops / cells kept) / no / no cache in the compiled dir
 

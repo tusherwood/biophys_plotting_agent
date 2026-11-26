@@ -82,7 +82,9 @@ Every block holds only gated cells (current files); see the metadata table above
   — plus confidence/QC columns (`pair_mass_confidence_score`, `pair_volume_confidence`,
   `pair_density_confidence`, `pair_qc_fail_mask`, `pair_qc_warn_mask`, `pair_status_code`,
   `pair_status_text`, `pair_mass_cell_index`, `pair_volume_cell_index`, `pair_matched_peak_index`,
-  `pair_media_density_g_per_mL`, `pair_buoyant_density`). The loader requires `pair_mass_pg`,
+  `pair_media_density_g_per_mL`, `pair_buoyant_density`). The three confidence columns, when
+  present, are carried row-aligned as `record["qc"]` (trimmed with the props by `reject_outliers`)
+  for the QC deck's pairing-confidence plots. The loader requires `pair_mass_pg`,
   `pair_volume_fl`, and `pair_cell_density_g_per_mL` to be present whenever a `pair_` block exists
   at all — it raises a clear error naming the sample if any are missing, rather than falling back.
 
@@ -224,7 +226,16 @@ samples only) puts the `props_vs_time` figures in `<exp>_vs_time_fig/` and the d
 {datatype}_{prop}_{kind}_by_{colA}-x-{colB}.png    # cross_groups (crossing on request)
 {datatype}_{prop}_heatmap_{colX}-x-{colY}.png      # grid_heatmap (grid search, user-confirmed)
 {datatype}_{prop1-prop2-...}_vs_time_{slug(sample)}.png  # props_vs_time (per sample, default; in <exp>_vs_time_fig/)
+{datatype}_{prop}_repsummary_by_{col}.png          # replicate_summary (per-sample medians [+ stats])
+{datatype}_{prop}_foldchange_by_{col}.png          # fold_change forest vs REFERENCES[col]
+{datatype}_{prop}_qshift_by_{col}.png              # quantile_shift vs REFERENCES[col]
+stats/{datatype}_{prop}_stats_by_{col}.csv         # compare_to_reference table (in <exp>_fig/)
+ifxm-{cellcol}_{prop}_..._by_{cellcol}.png         # CELL_SPLIT figures (samples split per cell class)
+{datatype}_qc_cell_counts.png, {datatype}_qc_drift.png,
+{datatype}_qc_{confidence}_ridge.png, {datatype}_{prop}_vs_{confidence}.png   # QC deck (<exp>_qc_fig/)
 ```
+
+The QC deck (`qc_report`, default) goes to `<exp>_qc_fig/` → `<exp>_qc.pptx`.
 
 **Processed data (iFXM, default).** `export_processed` writes
 `processed_data/<exp>_processed.xlsx`, which holds the plotted cells: gated, finite, and after the

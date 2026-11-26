@@ -13,8 +13,8 @@ plots from those roles; `autoplot` runs them. Every column becomes a grouping/co
 time column is used to order samples sequentially. Use the explicit combinators (see the bottom of
 main) for full control.
 
-Run it with the same Python env that has: numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow
-(+ pyarrow, and vqvae_cache_io.py beside the toolkit, when CROP_CACHE is on).
+Run it with the same Python env that has: numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow,
+scipy (p-values; skipped with a warning without it) (+ pyarrow, and vqvae_cache_io.py beside the toolkit, when CROP_CACHE is on).
 """
 from pathlib import Path
 
@@ -43,6 +43,13 @@ PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
 # own fig dir so it doesn't mix into the main deck. iFXM paired samples only.
 TIME_FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_vs_time_fig"
 TIME_PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_props_vs_time.pptx"
+# Default third deck: QC — cell-count waterfall, per-sample medians in acquisition order (drift of
+# repeated conditions), and pairing-confidence ridges / scatters. Own fig dir, never the main deck.
+QC_FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_qc_fig"
+QC_PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_qc.pptx"
+# Column giving the acquisition order for the drift plot (e.g. a run index / timestamp), or None
+# to use the metadata row order.
+QC_ORDER_COL = None
 # Default export (iFXM): the plotted cells (gated + post-outlier-rejection) as an xlsx in
 # experiment_data.xlsx's layout — one sheet per sample, mass / volume / density columns only.
 PROCESSED_XLSX = OUT_ROOT / "processed_data" / f"{EXP_NAME}_processed.xlsx"
@@ -78,6 +85,19 @@ ROLE_OVERRIDES = {}
 # confirms. Each entry is (x_col, y_col), or {"cols": (x_col, y_col), "show_repeats": True} to also
 # show repeated control samples individually beside the grid (the grid cell shows their mean).
 GRID_PAIRS = []
+
+# Statistics: the CONFIRMED reference (control) value per grouping column, e.g.
+# {"drug_name": "dmso", "dose_uM": 0}. Each entry adds, per prop: stats on that column's
+# replicate_summary and compare_groups box, a fold_change forest (% change in median vs the
+# reference, 95% hierarchical-bootstrap CI) and a quantile_shift plot; tables go to
+# FIG_DIR/stats/*.csv. Comparisons are made within strata (other crossed columns, e.g. time).
+# render_plan lists suggested references — add one here only after the user confirms it.
+REFERENCES = {}
+
+# Split cells by a per-cell annotation (only if the user asked; e.g. the sickle_annotations sheet
+# written by annotate_sickle_cells.py): {"sheet": "sickle_annotations", "col": "sickle_class",
+# "reference": "normal"} ("reference" optional — adds stats vs that class). None = off.
+CELL_SPLIT = None
 
 
 def main() -> None:
@@ -122,16 +142,37 @@ def main() -> None:
     if ifxm:
         roles = tk.infer_roles(ifxm, overrides=ROLE_OVERRIDES)
         plan = tk.build_plan(ifxm, "ifxm", roles=roles, props=list(IFXM_LABELS),
-                             scatter_pairs=SCATTER_PAIRS, grid_pairs=GRID_PAIRS)
+                             scatter_pairs=SCATTER_PAIRS, grid_pairs=GRID_PAIRS,
+                             references=REFERENCES)
         print(tk.render_plan(plan))       # review; set ROLE_OVERRIDES for any [CONFIRM] columns
         tk.autoplot(ifxm, plan, "ifxm", FIG_DIR, prop_labels=IFXM_LABELS,
                     paired_records=ifxm_paired)
+
+    # --- Per-cell split (CELL_SPLIT): each sample split by a per-cell class, e.g. sickle ------
+    # Joined on pair_cell_id <-> cell_id_source per sample (data_schema.md "Per-cell ids"); paired
+    # samples only. The split column then groups / is compared like any annotation column, within
+    # strata of the sample-level columns (e.g. sickle vs normal at each drug x time).
+    if ifxm and CELL_SPLIT:
+        col = CELL_SPLIT["col"]
+        ann = tk.attach_cell_annotations(ifxm, COMPILED_DIR, sheet=CELL_SPLIT["sheet"],
+                                         columns=[col])
+        split = tk.split_by_cell_col(ann, col)
+        sroles = tk.infer_roles(split, overrides=ROLE_OVERRIDES)
+        sref = CELL_SPLIT.get("reference")
+        for prop, label in IFXM_LABELS.items():
+            tk.compare_groups(split, prop, label, f"ifxm-{col}", FIG_DIR, group_col=col,
+                              roles=sroles, stats_ref=sref)
+            tk.replicate_summary(split, prop, label, f"ifxm-{col}", FIG_DIR, group_col=col,
+                                 roles=sroles, reference=sref)
+            if sref is not None:
+                tk.fold_change(split, prop, label, f"ifxm-{col}", FIG_DIR, group_col=col,
+                               roles=sroles, reference=sref)
 
     # --- Coulter --------------------------------------------------------------------------
     if coulter:
         croles = tk.infer_roles(coulter, overrides=ROLE_OVERRIDES)
         cplan = tk.build_plan(coulter, "coulter", roles=croles, props=list(COULTER_LABELS),
-                              grid_pairs=GRID_PAIRS)
+                              grid_pairs=GRID_PAIRS, references=REFERENCES)
         print(tk.render_plan(cplan))      # includes the per-sample cell-count table
         tk.autoplot(coulter, cplan, "coulter", FIG_DIR, prop_labels=COULTER_LABELS)
 
@@ -147,6 +188,13 @@ def main() -> None:
     #                   cols=("is_activated", "media"))   # crossing on request
     #   tk.grid_heatmap(ifxm, "density", "Density (g/mL)", "ifxm", FIG_DIR,
     #                   cols=("osm_mOsmL", "dose_uM"), show_repeats=True)   # grid search, confirmed
+    #   tk.replicate_summary(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR,
+    #                        group_col="drug_name", reference="dmso")       # dots = sample medians
+    #   tk.fold_change(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR,
+    #                  group_col="drug_name", reference="dmso")            # forest, 95% CI
+    #   tk.quantile_shift(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR,
+    #                     group_col="drug_name", reference="dmso")         # decile shift vs ref
+    #   tk.stats_table(tk.compare_to_reference(ifxm, "mass", "drug_name", "dmso"))  # the numbers
     #
     # Hand-rolled figures: legends must not cover the data. Draw the data first, then
     #   tk.place_legend(ax, handles=[...], loc="upper right")   # moves itself if that spot is busy
@@ -167,6 +215,18 @@ def main() -> None:
                          props=[p for p in ("mass", "vol", "density") if p in IFXM_LABELS],
                          prop_labels=IFXM_LABELS, trend="binned_median")
         tk.save_pptx(TIME_FIG_DIR, TIME_PPTX_OUT)
+
+    # --- Default third deck: QC (cell-count waterfall, acquisition-order drift, pairing
+    # confidence). Same records as the main deck (after rejection); pairing confidence needs the
+    # load_ifxm_paired records.
+    if ifxm:
+        tk.qc_report(ifxm, "ifxm", QC_FIG_DIR, paired_records=ifxm_paired,
+                     props=list(IFXM_LABELS), prop_labels=IFXM_LABELS, roles=roles,
+                     order_col=QC_ORDER_COL)
+    if coulter:
+        tk.qc_report(coulter, "coulter", QC_FIG_DIR, props=list(COULTER_LABELS),
+                     prop_labels=COULTER_LABELS, roles=croles, order_col=QC_ORDER_COL)
+    tk.save_pptx(QC_FIG_DIR, QC_PPTX_OUT)
 
 
 if __name__ == "__main__":

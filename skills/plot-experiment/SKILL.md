@@ -23,8 +23,10 @@ re-run the heavy analysis pipeline.
 Bundled files (reference via `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/`):
 - `biophys_plot_toolkit.py` — the library: loaders → `infer_roles` → low-level `draw_*` →
   combinators (`plot_grouped`/`compare_groups`/`timecourse_by`/`scatter_by`/`facet`/`cross_groups`/
-  `grid_heatmap`/`props_vs_time`)
-  → `build_plan`/`render_plan`/`autoplot` → pptx (plus a default second `props_vs_time` deck).
+  `grid_heatmap`/`props_vs_time`), replicate-aware statistics (`replicate_summary`/`fold_change`/
+  `quantile_shift`), per-cell splits (`attach_cell_annotations`/`split_by_cell_col`)
+  → `build_plan`/`render_plan`/`autoplot` → pptx (plus default second `props_vs_time` and third
+  `qc_report` decks).
 - `reference_driver.py` — the driver template you adapt.
 - `vqvae_cache_io.py` — torch-free crop-cache row selection behind `tk.export_processed_cache`
   (copied into the analysis dir only when the user wants the cropped image cache).
@@ -109,6 +111,47 @@ heatmaps — NOT included"**. Do not add them on your own:
   `[{"cols": (x_col, y_col), "show_repeats": True}]`). With no suggestion, or a no, leave it empty.
 - Pairs that the detector misses can still be added if the user asks for a grid heatmap.
 
+**Statistics reference (control) — ask every run that has a grouping column (hard requirement).**
+Statistics are computed only against a reference value the user confirmed. `render_plan` lists,
+under "Statistics reference (control) per grouping column", a guess per grouping column
+(`tk.suggest_references`: boolean → the falsey value, ordered → the lowest, categorical → a value
+named like a control such as `dmso`/`control`/`vehicle`/`untreated`, else none) and the strata each
+comparison will be made within. In the same `AskUserQuestion` call as outlier rejection, ask which
+reference to use for each grouping column that has one worth testing. Offer the guess as
+"(Recommended)", the other values, and **no stats**. Put the answers in the driver's `REFERENCES`
+(`{col: value}`); leave it `{}` if declined. A past analysis's `REFERENCES` (step 0) is the
+suggested option. What each confirmed reference adds (per prop):
+- stats on that column's `replicate_summary` and, when there is a single stratum, on its
+  `compare_groups` box plot,
+- a `fold_change` forest (% change in median vs the reference, 95% CI),
+- a `quantile_shift` plot (decile-by-decile difference vs the reference, 95% band),
+- the table `<exp>_fig/stats/{datatype}_{prop}_stats_by_{col}.csv`.
+
+`replicate_summary` (dots = per-sample medians, bar = mean ± SD across samples, faint = cells) is
+planned for every grouping column with ≥ 2 samples at some position, with or without a reference.
+
+How the stats work (state this in the notes and when describing the figures): the sample is the
+unit of replication, not the cell. Each sample is reduced to its deciles. A group's median is the
+mean of its samples' medians, and its 95% CI comes from a hierarchical bootstrap (resample
+samples, then cells within each sample; with one sample the CI only reflects cell sampling). The
+p-value is Welch's t-test on the per-sample medians (on their logs when all are positive). It
+needs ≥ 2 samples on each side, is BH-adjusted across the comparisons of one (prop, column), and
+needs `scipy`, without which p-values are skipped with a warning. The effect size is Cliff's δ on
+the pooled cells. Comparisons are made **within strata**: other annotation columns genuinely
+crossed with the grouping column (`tk.strata_cols`, e.g. time when every drug was sampled at every
+time) are held fixed. A stratum without a reference sample is skipped and named in the output.
+
+**Per-cell split — ask only when there is a per-cell annotation table.** If
+`experiment_data.xlsx` has a `sickle_annotations` sheet (or the user points to another per-cell
+table), ask in the same `AskUserQuestion` call whether to also split cells by its class column
+(e.g. `sickle_class`) and which class is the reference. On a yes, set `CELL_SPLIT = {"sheet": ...,
+"col": ..., "reference": ...}` in the driver. It joins the table onto each paired sample's cells
+(`tk.attach_cell_annotations`, via `cell_id_source`), splits each sample into one record per class
+(`tk.split_by_cell_col`, named `<sample> [<class>]`), and plots `compare_groups` +
+`replicate_summary` (+ `fold_change` with a reference) by that column, within strata of the
+sample-level columns. Files are prefixed `ifxm-<col>_`. Don't pass split records to
+`export_processed`.
+
 **Outlier rejection — ask every run (hard requirement).** Alongside the plan approval, always ask
 with `AskUserQuestion` whether to apply outlier rejection. Propose, as the first
 "(Recommended)" option, **Tukey fences (`iqr`, k=1.5), `per_sample` scope, on mass, volume and
@@ -173,7 +216,13 @@ loudly rather than silently falling back.
    - `plot_grouped(group_col=…)` — per-group detail (ridge + box).
    - `compare_groups(group_col=…)` — cross-group comparison; default `agg="per_sample"`, both box
      and ridge.
-   - `timecourse_by(time_col=…, series_col=…)` — unit-aware, sequentially ordered.
+   - `timecourse_by(time_col=…, series_col=…, spread="cv")` — unit-aware, sequentially ordered;
+     the lower panel shows each sample's within-sample spread (`"cv"` SD/mean % by default,
+     `"rcv"` IQR/median %, `"sd"`, `"iqr"`, or `None` to drop the panel).
+   - `replicate_summary(group_col=…, reference=…)`, `fold_change(group_col=…, reference=…)`,
+     `quantile_shift(group_col=…, reference=…)`, `compare_groups(…, stats_ref=…)` — the
+     statistics figures (see "Statistics reference" in step 2). `tk.stats_table(
+     tk.compare_to_reference(records, prop, col, ref))` gives the numbers as a DataFrame.
    - `scatter_by(prop_x, prop_y, group_col=…)` — per-cell scatter + marginals; **pass
      `load_ifxm_paired` records** (row-aligned). All panels in one figure share x/y limits that
      span every panel's points. Keep that rule in any hand-rolled scatter grid (`tk._span_limits`
@@ -196,6 +245,19 @@ loudly rather than silently falling back.
      `"rolling_mean"` (moving average) or `"rolling_median"` (`window=` cells, default ~n/30), or
      `None`. x-axis auto-switches to minutes for runs under 1 h (`time_unit=`). Narrow
      `samples=`/`props=` or change `trend` only when the user asks.
+   - `qc_report(records, datatype, QC_FIG_DIR, paired_records=…)` — **always made, as a separate
+     default QC deck** (not in `build_plan`; **do not ask whether to make it**). It goes to
+     `<exp>_qc_fig/` → `<exp>_qc.pptx`, never the main deck. Contents:
+     - `qc_cell_counts`: per-sample bars of cells before gating, after gating and after outlier
+       rejection, with % kept; samples keeping < 50% are flagged red.
+     - `qc_drift`: per-sample median ± IQR of each prop in acquisition order (metadata row order,
+       or `QC_ORDER_COL`). Samples sharing every annotation value (repeated conditions, e.g. a
+       control re-run through the session) are connected, with their drift in %/step.
+     - `qc_pair_confidence` (iFXM paired records only): a ridge of `mass_confidence_score` /
+       `volume_confidence` / `density_confidence` across samples, plus each prop vs its confidence.
+     Pass the same records as the main deck (after rejection) plus the `load_ifxm_paired` records.
+     Coulter gets the first two. Set `QC_ORDER_COL` only if the metadata has an acquisition
+     order/timestamp column and the row order isn't the run order.
    Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. Add the
    `reject_outliers` lines the user chose in step 2 (none if they declined); beyond that, tame a
    heavy tail with axis limits in the driver.
@@ -226,7 +288,7 @@ otherwise conveyed elsewhere on that same figure, not the raw `sample_name`. Con
    — it isn't specific to time/osm/drug columns, it's a general labeling rule for every axis.
 
 ### 4. Run it
-Ensure the deps are available (numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow).
+Ensure the deps are available (numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow, scipy).
 A conda env spec is bundled at `${CLAUDE_PLUGIN_ROOT}/environment.yaml`
 (`conda env create -f ...` then activate `biophys_plotting`), or reuse an existing analysis env.
 Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_schema.md`:
@@ -234,7 +296,9 @@ Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_sch
 `{datatype}_{propY}_vs_{propX}[_{col}={value}].png`, `{datatype}_{prop}_heatmap_{colX}-x-{colY}.png`,
 plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name), and — for iFXM with paired
 samples — the per-sample `{datatype}_{props}_vs_time_{sample}.png` figures in `<exp>_vs_time_fig/`
-compiled into `<exp>_props_vs_time.pptx`, and (iFXM) the plotted cells to
+compiled into `<exp>_props_vs_time.pptx`, the QC figures in `<exp>_qc_fig/` compiled into
+`<exp>_qc.pptx`, the stats tables in `<exp>_fig/stats/` (when `REFERENCES` is set), and (iFXM)
+the plotted cells to
 `processed_data/<exp>_processed.xlsx` (see "Processed-data export" below). You then write
 `<exp>_analysis_notes.md` beside the pptx (step 6).
 
